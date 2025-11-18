@@ -23,7 +23,6 @@ def set_seed(seed: int = 42):
 
 
 def mape_adj(pred, target, eps: float = 1e-3):
-    """Adjusted MAPE（避免分母过小）"""
     return (torch.abs(pred - target) / torch.clamp(torch.abs(target), min=eps)).mean()
 
 
@@ -343,7 +342,7 @@ class TrendExpert(nn.Module):
 
 class ZoneExpert(nn.Module):
     """
-    区间专家：基于分桶预测每个时间步所属的值域区间。
+    区间专家：基于分桶预测每个时间步所属的值域区间
     """
     def __init__(self, d_model: int, num_bins: int = 5, hidden: int = 128):
         super().__init__()
@@ -361,7 +360,7 @@ class ZoneExpert(nn.Module):
         self.momentum = 0.05
 
     def update_bins_from_labels(self, y: torch.Tensor):
-        """用当前 batch 标签的分位数平滑更新 bin 边界。"""
+        """用当前 batch 标签的分位数平滑更新 bin 边界"""
         y1 = y.detach().reshape(-1)
         if y1.numel() < self.num_bins * 4:
             return
@@ -381,7 +380,7 @@ class ZoneExpert(nn.Module):
 
 
 class ValueExpert(nn.Module):
-    """值专家：拟合残差 y - pred_M。"""
+    """值专家：拟合残差 y - pred_M"""
 
     def __init__(self, d_model: int, hidden: int = 128):
         super().__init__()
@@ -442,7 +441,7 @@ class GNNMoETransformerRegressor(nn.Module):
         Gate(E) -> 4 状态概率，聚合为全局权重；
         Trend / Zone / Value 三专家 + 不作用状态；
         最终 pred = pred_M + g_trend * pred_trend + g_value * pred_value
-        （Zone 通过区间约束/惩罚影响 loss）。
+        （Zone 通过区间约束/惩罚影响 loss）
     """
     def __init__(
         self,
@@ -504,6 +503,13 @@ class GNNMoETransformerRegressor(nn.Module):
         self.zone_expert = ZoneExpert(d_model, num_bins=num_bins, hidden=moe_hidden)
         self.value_expert = ValueExpert(d_model, hidden=moe_hidden)
 
+        if self.flags.use_gnn:
+            self.var_trend_proj = nn.Linear(gnn_hidden, d_model)
+            self.var_value_proj = nn.Linear(gnn_hidden, d_model)
+        else:
+            self.var_trend_proj = None
+            self.var_value_proj = None
+
         # gate
         if self.flags.use_gnn and self.flags.use_moe:
             self.var_gating = VariableGating(gnn_hidden, num_states=4)
@@ -541,16 +547,13 @@ class GNNMoETransformerRegressor(nn.Module):
         B, L, D = X.shape
         assert D == self.D
 
-        Xt_raw = self.time_linear(X)  # (B,L,d_model)
+        Xt = self.time_linear(X)        # (B,L,d_model)
         if self.vsn is not None:
-            w_vsn = self.vsn(Xt_raw)    # (B,L,D)
-            X_weighted = X * w_vsn      # element-wise 特征选择
-            Xt = self.time_linear(X_weighted)
+            w_vsn = self.vsn(Xt)        # (B,L,D)
         else:
             w_vsn = None
-            Xt = Xt_raw
 
-        H = self.backbone(Xt)          # (B,L,d_model)
+        H = self.backbone(Xt)
         pred_M = self.base_out(H)      # (B,L,1)
 
         # --------- 区间专家（zone） ---------
@@ -560,36 +563,62 @@ class GNNMoETransformerRegressor(nn.Module):
         p_bins = F.softmax(logits_bins, dim=-1)         # (B,L,K)
         label_bins = self.zone_expert.labels_from_y(y) if y is not None else None
 
-        # --------- Trend & Value 专家 ---------
-        pred_trend = self.trend_expert(H) if self.flags.use_trend else torch.zeros_like(pred_M)
-        pred_value = self.value_expert(H) if self.flags.use_value else torch.zeros_like(pred_M)
-
-        # --------- GNN + 变量级 Gate（4 状态） ---------
+        # --------- GNN + 变量级 Gate（4 状态） + var_hidden_states ---------
         if self.flags.use_gnn and self.flags.use_moe:
-            E = self._compute_variable_embeddings(X)     # (D,H_g)
-            gate_logits, p_vars = self.var_gating(E)     # (D,4)
-            p_global = p_vars.mean(dim=0)                # (4,)
+            E = self._compute_variable_embeddings(X)      # (D,H_g)
+            gate_logits, p_vars = self.var_gating(E)      # (D,4)
+            var_labels = torch.argmax(p_vars, dim=-1)     # (D,) 
 
-            # 顺序：[none, trend, zone, value]
-            g_none = p_global[0]
+            # 变量级 hidden states：embedding -> expert 空间
+            var_h_trend = self.var_trend_proj(E)          # (D,d_model)
+            var_h_value = self.var_value_proj(E)          # (D,d_model)
+
+            # Gate 权重（按变量区分），并利用 none 抑制不重要变量
+            p_none  = p_vars[:, 0:1]                      # (D,1)
+            p_trend = p_vars[:, 1:1+1]                    # (D,1)
+            p_zone  = p_vars[:, 2:2+1]                    # (D,1)
+            p_value = p_vars[:, 3:3+1]                    # (D,1)
+
+            # “不作用”变量的贡献被 (1 - p_none) 抑制
+            w_trend = p_trend * (1.0 - p_none)            # (D,1)
+            w_value = p_value * (1.0 - p_none)            # (D,1)
+
+            # 按变量加权平均得到各专家的 var_hidden_state（全局向量）
+            v_trend = (w_trend * var_h_trend).sum(dim=0) / (w_trend.sum() + 1e-6)  # (d_model,)
+            v_value = (w_value * var_h_value).sum(dim=0) / (w_value.sum() + 1e-6)  # (d_model,)
+
+            H_trend = H + v_trend.view(1, 1, -1)          # (B,L,d_model)
+            H_value = H + v_value.view(1, 1, -1)          # (B,L,d_model)
+
+            pred_trend = self.trend_expert(H_trend) if self.flags.use_trend else torch.zeros_like(pred_M)
+            pred_value = self.value_expert(H_value) if self.flags.use_value else torch.zeros_like(pred_M)
+
+            p_global = p_vars.mean(dim=0)                 # (4,)
+            g_none  = p_global[0]
             g_trend = p_global[1]
-            g_zone = p_global[2]
+            g_zone  = p_global[2]
             g_value = p_global[3]
 
-            # broadcast 为 (1,1,1) 用于缩放专家输出
             g_trend_b = g_trend.view(1, 1, 1)
             g_value_b = g_value.view(1, 1, 1)
+
         else:
-            # 无 GNN 或禁用 MoE 时，退化为普通 Transformer + 专家全开
+            # 无 GNN 或禁用 MoE 时，退化为普通 Transformer + 专家直接作用在 H 上
             E = None
             gate_logits = None
             p_vars = None
             p_global = None
-            g_none = torch.tensor(0.0, device=X.device)
+            var_labels = None
+
+            g_none  = torch.tensor(0.0, device=X.device)
             g_trend = torch.tensor(1.0, device=X.device)
-            g_zone = torch.tensor(1.0, device=X.device)
+            g_zone  = torch.tensor(1.0, device=X.device)
             g_value = torch.tensor(1.0, device=X.device)
+
             g_trend_b = g_value_b = torch.ones(1, 1, 1, device=X.device)
+
+            pred_trend = self.trend_expert(H) if self.flags.use_trend else torch.zeros_like(pred_M)
+            pred_value = self.value_expert(H) if self.flags.use_value else torch.zeros_like(pred_M)
 
         pred_raw = pred_M + g_trend_b * pred_trend + g_value_b * pred_value  # (B,L,1)
 
@@ -602,14 +631,17 @@ class GNNMoETransformerRegressor(nn.Module):
             "label_bins": label_bins,
             "E": E,
             "gate_logits": gate_logits,
-            "p_vars": p_vars,          # (D,4)
-            "p_global": p_global,      # (4,)
+            "p_vars": p_vars,
+            "p_global": p_global,
             "g_none": g_none,
             "g_trend": g_trend,
             "g_zone": g_zone,
             "g_value": g_value,
             "pred_raw": pred_raw,
             "w_vsn": w_vsn,
+            "var_labels": var_labels,          # 每个变量最终的 MoE 类别（None/Trend/Zone/Value）
+            "var_h_trend": var_h_trend if self.flags.use_gnn and self.flags.use_moe else None,
+            "var_h_value": var_h_value if self.flags.use_gnn and self.flags.use_moe else None,
         }
 
         return (pred_raw, aux) if return_aux else pred_raw
