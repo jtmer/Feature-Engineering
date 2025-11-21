@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.utils import dense_to_sparse
 
+from transformers.activations import ACT2FN
+from transformers import AutoModelForCausalLM, AutoConfig
+from sundial.configuration_sundial import SundialConfig
+from sundial.ts_generation_mixin import TSGenerationMixin
 
 # ==============================
 # Utils
@@ -30,6 +34,39 @@ def to_device(x, device):
     if isinstance(x, (list, tuple)):
         return [to_device(xx, device) for xx in x]
     return x.to(device)
+
+
+class SundialPatchEmbedding(nn.Module):
+    def __init__(self, config: SundialConfig):
+        super().__init__()
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.hidden_layer = nn.Linear(
+            config.input_token_len * 2, config.intermediate_size
+        )
+        self.act = ACT2FN[config.hidden_act]
+        self.output_layer = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.residual_layer = nn.Linear(config.input_token_len * 2, config.hidden_size)
+        self.input_token_len = config.input_token_len
+
+    def forward(self, x):
+        mask = torch.ones_like(x, dtype=torch.float32)
+        input_length = x.shape[-1]
+        padding_length = (
+            self.input_token_len - (input_length % self.input_token_len)
+        ) % self.input_token_len
+        x = F.pad(x, (padding_length, 0))
+        mask = F.pad(mask, (padding_length, 0))
+        x = x.unfold(dimension=-1, size=self.input_token_len, step=self.input_token_len)
+        mask = mask.unfold(
+            dimension=-1, size=self.input_token_len, step=self.input_token_len
+        )
+
+        x = torch.cat([x, mask], dim=-1)
+        hid = self.act(self.hidden_layer(x))
+        out = self.dropout(self.output_layer(hid))
+        res = self.residual_layer(x)
+        out = out + res
+        return out
 
 
 # ==============================
@@ -399,22 +436,34 @@ class ValueExpert(nn.Module):
 class VariableGating(nn.Module):
     """
     变量级 Gate：
-      输入：变量 embedding E_j ∈ R^{H_g}
-      输出：4 维 logits -> softmax 概率：
-        [p_none, p_trend, p_zone, p_value]
+      输入：变量 embedding E_j ∈ R^{H_g}，以及来自目标 hidden states 的上下文 c ∈ R^{H_g}
+      输出：4 维 logits -> softmax 概率：[p_none, p_trend, p_zone, p_value]
     """
-    def __init__(self, h_gnn: int, num_states: int = 4):
+    def __init__(self, h_gnn: int, num_states: int = 4, use_context: bool = True):
         super().__init__()
+        self.use_context = use_context
+        in_dim = h_gnn * (2 if use_context else 1)
         self.mlp = nn.Sequential(
-            nn.Linear(h_gnn, h_gnn),
+            nn.Linear(in_dim, h_gnn),
             nn.GELU(),
             nn.Linear(h_gnn, num_states),
         )
 
-    def forward(self, E):  # E:(D,H_g)
-        logits = self.mlp(E)           # (D,4)
+    def forward(self, E, ctx: Optional[torch.Tensor] = None):
+        """
+        E:   (D,H_g)
+        ctx: (H_g,) 或 None
+        """
+        if self.use_context and (ctx is not None):
+            ctx_exp = ctx.unsqueeze(0).expand(E.size(0), -1)  # (D,H_g)
+            x = torch.cat([E, ctx_exp], dim=-1)               # (D, 2H_g)
+        else:
+            x = E                                             # (D,H_g)
+
+        logits = self.mlp(x)           # (D,4)
         p = F.softmax(logits, dim=-1)  # (D,4)
         return logits, p
+
 
 
 # ==============================
@@ -480,12 +529,30 @@ class GNNMoETransformerRegressor(nn.Module):
         else:
             self.gnn = None
 
-        # VSN 可选
-        self.time_linear = nn.Linear(self.D, d_model)
-        self.vsn = VariableSelection(d_model, self.D) if self.flags.use_vsn else None
+        # self.y_embed = nn.Linear(1, d_model)
+        self.backbone_config = AutoConfig.from_pretrained(
+            'hf_ltm/sundial-base-128m', trust_remote_code=True
+        )
+        self.backbone_config.use_return_dict = True
+        self.backbone = AutoModelForCausalLM.from_pretrained(
+            'hf_ltm/sundial-base-128m', trust_remote_code=True, config=self.backbone_config
+        )
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        
+        self.y_embed = SundialPatchEmbedding(self.backbone_config)
+        
+        # 把 backbone 的标量预测 pred_M 映射到专家空间 (B,L_pred,d_model)
+        self.pred_proj = nn.Linear(1, d_model)
 
-        # Transformer 主干
-        self.backbone = TransformerBackbone(
+        # # VSN 可选
+        # self.time_linear = nn.Linear(self.D, d_model)
+        # self.vsn = VariableSelection(d_model, self.D) if self.flags.use_vsn else None
+
+        # ====== 新增：MoE 专用的轻量时序 encoder，用协变量 X 生成 H_seq ======
+        # 先把 D 维协变量映射到 d_model，再过一个小 Transformer
+        self.moe_input_proj = nn.Linear(self.D, d_model)
+        self.moe_backbone = TransformerBackbone(
             d_in=d_model,
             d_model=d_model,
             num_heads=num_heads,
@@ -494,9 +561,6 @@ class GNNMoETransformerRegressor(nn.Module):
             dropout=dropout,
             posenc=posenc,
         )
-
-        # 基准预测头
-        self.base_out = nn.Linear(d_model, 1)
 
         # MoE：三个专家
         self.trend_expert = TrendExpert(d_model, stride=downsample_stride)
@@ -512,9 +576,12 @@ class GNNMoETransformerRegressor(nn.Module):
 
         # gate
         if self.flags.use_gnn and self.flags.use_moe:
-            self.var_gating = VariableGating(gnn_hidden, num_states=4)
+            self.var_gating = VariableGating(gnn_hidden, num_states=4, use_context=True)
+            # H 的全局上下文 -> gate context（维度对齐 H_g）
+            self.gate_ctx_proj = nn.Linear(d_model, gnn_hidden)
         else:
-            self.var_gating = None  # 退化为无门控
+            self.var_gating = None
+            self.gate_ctx_proj = None
 
     def _compute_variable_embeddings(self, X: torch.Tensor):
         """
@@ -533,94 +600,97 @@ class GNNMoETransformerRegressor(nn.Module):
 
     def forward(
         self,
-        X: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
+        X: torch.Tensor,              # (B, L_pred, D)  未来协变量
+        y_hist: torch.Tensor,         # (B, L_hist, 1)  过去目标变量
+        y_future: Optional[torch.Tensor] = None,  # (B, L_pred, 1)  未来目标变量
         return_aux: bool = False,
     ):
         """
-        X: (B,L,D)
-        y: (B,L,1) 
-        返回：
-          pred: (B,L,1)
-          aux:  辅助输出，用于 loss 计算
+        语义：
+          输入：未来协变量 X_future + 过去 y_hist
+          （训练时）提供未来 y_future 作为监督和区间/趋势 target
+        输出：
+          pred: (B,L_pred,1)  对未来窗口的预测
         """
-        B, L, D = X.shape
+        B, L_pred, D = X.shape
         assert D == self.D
+        B_y, L_hist, C_y = y_hist.shape
+        assert B_y == B and C_y == 1
+        y_hist = y_hist.squeeze()
 
-        Xt = self.time_linear(X)        # (B,L,d_model)
-        if self.vsn is not None:
-            w_vsn = self.vsn(Xt)        # (B,L,D)
-        else:
-            w_vsn = None
+        device = X.device
+        dtype = X.dtype
+        
+        # backbone 预测
+        with torch.no_grad():
+            pred_M = self.backbone.generate(
+                y_hist,
+                max_new_tokens=self.backbone_config.test_pred_len,
+                num_samples=self.backbone_config.test_n_sample,
+            ).mean(dim=1)
+        if pred_M.dim() == 2:
+            pred_M = pred_M.unsqueeze(-1)         # (B, L_pred, 1)
+        
+        # y 的 embedding 参与 GNN
+        y_ctx_emb = self.y_embed(y_hist)            # (B,L_hist,y_emb_dim)
+        # 全局上下文：先对时间，再对 batch 求平均
+        gate_ctx = y_ctx_emb.mean(dim=1).mean(dim=0)   # (d_model,)
+        gate_ctx = self.gate_ctx_proj(gate_ctx)         # (H_g)
+        
+        # 协变量 X → MoE 的序列表示 H_seq
+        Z = self.moe_input_proj(X)         # (B,L_pred,d_model)
+        H_seq = self.moe_backbone(Z)       # (B,L_pred,d_model)
 
-        H = self.backbone(Xt)
-        pred_M = self.base_out(H)      # (B,L,1)
+        # GNN + 变量级 Gate + var_hidden
+        # 这里用未来窗口的协变量 X 估计变量 embedding
+        E = self._compute_variable_embeddings(X)       # (D,H_g)
+        gate_logits, p_vars = self.var_gating(E, gate_ctx)  # (D,4)
 
-        # --------- 区间专家（zone） ---------
-        if self.training and (y is not None):
-            self.zone_expert.update_bins_from_labels(y)
-        logits_bins = self.zone_expert(H)               # (B,L,K)
-        p_bins = F.softmax(logits_bins, dim=-1)         # (B,L,K)
-        label_bins = self.zone_expert.labels_from_y(y) if y is not None else None
+        var_labels = torch.argmax(p_vars, dim=-1)      # (D,)
 
-        # --------- GNN + 变量级 Gate（4 状态） + var_hidden_states ---------
-        if self.flags.use_gnn and self.flags.use_moe:
-            E = self._compute_variable_embeddings(X)      # (D,H_g)
-            gate_logits, p_vars = self.var_gating(E)      # (D,4)
-            var_labels = torch.argmax(p_vars, dim=-1)     # (D,) 
+        # Gate 权重（按变量区分），利用 none 抑制不重要变量
+        p_none  = p_vars[:, 0:1]                       # (D,1)
+        p_trend = p_vars[:, 1:2]                       # (D,1)
+        p_zone  = p_vars[:, 2:3]                       # (D,1)
+        p_value = p_vars[:, 3:4]                       # (D,1)
 
-            # 变量级 hidden states：embedding -> expert 空间
-            var_h_trend = self.var_trend_proj(E)          # (D,d_model)
-            var_h_value = self.var_value_proj(E)          # (D,d_model)
+        w_trend = p_trend * (1.0 - p_none)             # (D,1)
+        w_value = p_value * (1.0 - p_none)             # (D,1)
+        
+        # 变量级 hidden states：embedding -> expert 空间
+        var_h_trend = self.var_trend_proj(E)           # (D,d_model)
+        var_h_value = self.var_value_proj(E)           # (D,d_model)
 
-            # Gate 权重（按变量区分），并利用 none 抑制不重要变量
-            p_none  = p_vars[:, 0:1]                      # (D,1)
-            p_trend = p_vars[:, 1:1+1]                    # (D,1)
-            p_zone  = p_vars[:, 2:2+1]                    # (D,1)
-            p_value = p_vars[:, 3:3+1]                    # (D,1)
+        # 按变量加权平均得到各专家的 var_hidden_state（全局向量）
+        v_trend = (w_trend * var_h_trend).sum(dim=0) / (w_trend.sum() + 1e-6)  # (d_model,)
+        v_value = (w_value * var_h_value).sum(dim=0) / (w_value.sum() + 1e-6)  # (d_model,)
 
-            # “不作用”变量的贡献被 (1 - p_none) 抑制
-            w_trend = p_trend * (1.0 - p_none)            # (D,1)
-            w_value = p_value * (1.0 - p_none)            # (D,1)
+        # 将来自协变量侧的修正叠加到未来窗口的 H 上
+        # 这里加H_seq，是因为v_trend、v_value没有时间维度的信息，需要一个时间维度的基底
+        H_trend = H_seq + v_trend.view(1, 1, -1)           # (B,L_pred,d_model)
+        H_value = H_seq + v_value.view(1, 1, -1)           # (B,L_pred,d_model)
 
-            # 按变量加权平均得到各专家的 var_hidden_state（全局向量）
-            v_trend = (w_trend * var_h_trend).sum(dim=0) / (w_trend.sum() + 1e-6)  # (d_model,)
-            v_value = (w_value * var_h_value).sum(dim=0) / (w_value.sum() + 1e-6)  # (d_model,)
+        pred_trend = self.trend_expert(H_trend)
+        pred_value = self.value_expert(H_value)
 
-            H_trend = H + v_trend.view(1, 1, -1)          # (B,L,d_model)
-            H_value = H + v_value.view(1, 1, -1)          # (B,L,d_model)
+        # 聚合变量级 gate 得到全局权重
+        p_global = p_vars.mean(dim=0)                  # (4,)
+        g_none  = p_global[0]
+        g_trend = p_global[1]
+        g_zone  = p_global[2]
+        g_value = p_global[3]
 
-            pred_trend = self.trend_expert(H_trend) if self.flags.use_trend else torch.zeros_like(pred_M)
-            pred_value = self.value_expert(H_value) if self.flags.use_value else torch.zeros_like(pred_M)
+        g_trend_b = g_trend.view(1, 1, 1)
+        g_value_b = g_value.view(1, 1, 1)
 
-            p_global = p_vars.mean(dim=0)                 # (4,)
-            g_none  = p_global[0]
-            g_trend = p_global[1]
-            g_zone  = p_global[2]
-            g_value = p_global[3]
-
-            g_trend_b = g_trend.view(1, 1, 1)
-            g_value_b = g_value.view(1, 1, 1)
-
-        else:
-            # 无 GNN 或禁用 MoE 时，退化为普通 Transformer + 专家直接作用在 H 上
-            E = None
-            gate_logits = None
-            p_vars = None
-            p_global = None
-            var_labels = None
-
-            g_none  = torch.tensor(0.0, device=X.device)
-            g_trend = torch.tensor(1.0, device=X.device)
-            g_zone  = torch.tensor(1.0, device=X.device)
-            g_value = torch.tensor(1.0, device=X.device)
-
-            g_trend_b = g_value_b = torch.ones(1, 1, 1, device=X.device)
-
-            pred_trend = self.trend_expert(H) if self.flags.use_trend else torch.zeros_like(pred_M)
-            pred_value = self.value_expert(H) if self.flags.use_value else torch.zeros_like(pred_M)
-
-        pred_raw = pred_M + g_trend_b * pred_trend + g_value_b * pred_value  # (B,L,1)
+        pred_raw = pred_M + g_trend_b * pred_trend + g_value_b * pred_value  # (B,L_pred,1)
+        
+        # 区间专家（zone），基于未来窗口的 hidden
+        if self.training and (y_future is not None):
+            self.zone_expert.update_bins_from_labels(y_future)
+        logits_bins = self.zone_expert(H_seq)                  # (B,L_pred,K)
+        p_bins = F.softmax(logits_bins, dim=-1)            # (B,L_pred,K)
+        label_bins = self.zone_expert.labels_from_y(y_future) if y_future is not None else None
 
         aux = {
             "pred_M": pred_M,
@@ -638,10 +708,7 @@ class GNNMoETransformerRegressor(nn.Module):
             "g_zone": g_zone,
             "g_value": g_value,
             "pred_raw": pred_raw,
-            "w_vsn": w_vsn,
-            "var_labels": var_labels,          # 每个变量最终的 MoE 类别（None/Trend/Zone/Value）
-            "var_h_trend": var_h_trend if self.flags.use_gnn and self.flags.use_moe else None,
-            "var_h_value": var_h_value if self.flags.use_gnn and self.flags.use_moe else None,
+            "var_labels": var_labels,
         }
 
         return (pred_raw, aux) if return_aux else pred_raw
