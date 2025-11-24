@@ -549,9 +549,9 @@ class GNNMoETransformerRegressor(nn.Module):
         # self.time_linear = nn.Linear(self.D, d_model)
         # self.vsn = VariableSelection(d_model, self.D) if self.flags.use_vsn else None
 
-        # ====== 新增：MoE 专用的轻量时序 encoder，用协变量 X 生成 H_seq ======
-        # 先把 D 维协变量映射到 d_model，再过一个小 Transformer
-        self.moe_input_proj = nn.Linear(self.D, d_model)
+        # MoE：按变量独立的时序 encoder
+        # 每个变量只用自己的标量序列作为输入(后面reshape 成 (B*D, L, 1))
+        self.moe_input_proj = nn.Linear(1, d_model)
         self.moe_backbone = TransformerBackbone(
             d_in=d_model,
             d_model=d_model,
@@ -597,6 +597,25 @@ class GNNMoETransformerRegressor(nn.Module):
 
         E = self.gnn(node_feats, X)  # (D,H_g)
         return E
+    
+    def _build_moe_hidden_per_var(self, X: torch.Tensor):
+        """
+        X: (B, L_pred, D)
+        return:
+          H_var: (B, D, L_pred, d_model)  # 每个变量自己的 MoE hidden 序列
+        """
+        B, L_pred, D = X.shape
+        assert D == self.D
+
+        # (B, L, D) -> (B, D, L, 1)
+        X_var = X.permute(0, 2, 1).unsqueeze(-1).contiguous()   # (B,D,L,1)
+
+        X_flat = X_var.view(B * D, L_pred, 1)                   # (B*D,L,1)
+        Z_flat = self.moe_input_proj(X_flat)                    # (B*D,L,d_model)
+        H_flat = self.moe_backbone(Z_flat)                      # (B*D,L,d_model)
+
+        H_var = H_flat.view(B, D, L_pred, -1)                   # (B,D,L,d_model)
+        return H_var
 
     def forward(
         self,
@@ -634,12 +653,12 @@ class GNNMoETransformerRegressor(nn.Module):
         # y 的 embedding 参与 GNN
         y_ctx_emb = self.y_embed(y_hist)            # (B,L_hist,y_emb_dim)
         # 全局上下文：先对时间，再对 batch 求平均
-        gate_ctx = y_ctx_emb.mean(dim=1).mean(dim=0)   # (d_model,)
+        gate_ctx = y_ctx_emb.mean(dim=1).mean(dim=0)   # (y_emb_dim,)
         gate_ctx = self.gate_ctx_proj(gate_ctx)         # (H_g)
         
-        # 协变量 X → MoE 的序列表示 H_seq
-        Z = self.moe_input_proj(X)         # (B,L_pred,d_model)
-        H_seq = self.moe_backbone(Z)       # (B,L_pred,d_model)
+        # MoE：按变量构建时序 hidden
+        # H_var: (B, D, L_pred, d_model)
+        H_var = self._build_moe_hidden_per_var(X)
 
         # GNN + 变量级 Gate + var_hidden
         # 这里用未来窗口的协变量 X 估计变量 embedding
@@ -656,46 +675,51 @@ class GNNMoETransformerRegressor(nn.Module):
 
         w_trend = p_trend * (1.0 - p_none)             # (D,1)
         w_value = p_value * (1.0 - p_none)             # (D,1)
+        w_zone  = p_zone  * (1.0 - p_none)             # (D,1)
         
         # 变量级 hidden states：embedding -> expert 空间
         var_h_trend = self.var_trend_proj(E)           # (D,d_model)
         var_h_value = self.var_value_proj(E)           # (D,d_model)
+        v_trend = var_h_trend.view(1, D, 1, -1)   # (1,D,1,C)
+        v_value = var_h_value.view(1, D, 1, -1)   # (1,D,1,C)
+        
+        H_trend = H_var + v_trend                 # (B,D,L,C)
+        H_value = H_var + v_value                 # (B,D,L,C)
+        H_trend_flat = H_trend.view(B * D, L_pred, -1)   # (B*D,L,C)
+        H_value_flat = H_value.view(B * D, L_pred, -1)
+        
+        pred_trend_var = self.trend_expert(H_trend_flat).view(B, D, L_pred, 1)    # (B,D,L,1)
+        pred_value_var = self.value_expert(H_value_flat).view(B, D, L_pred, 1)    # (B,D,L,1)
 
-        # 按变量加权平均得到各专家的 var_hidden_state（全局向量）
-        v_trend = (w_trend * var_h_trend).sum(dim=0) / (w_trend.sum() + 1e-6)  # (d_model,)
-        v_value = (w_value * var_h_value).sum(dim=0) / (w_value.sum() + 1e-6)  # (d_model,)
+        # 归一化
+        w_trend = w_trend / (w_trend.sum() + 1e-6)  # (D,1)
+        w_value = w_value / (w_value.sum() + 1e-6)  # (D,1)
+        w_zone = w_zone / (w_zone.sum() + 1e-6)     # (D,1)
 
-        # 将来自协变量侧的修正叠加到未来窗口的 H 上
-        # 这里加H_seq，是因为v_trend、v_value没有时间维度的信息，需要一个时间维度的基底
-        H_trend = H_seq + v_trend.view(1, 1, -1)           # (B,L_pred,d_model)
-        H_value = H_seq + v_value.view(1, 1, -1)           # (B,L_pred,d_model)
+        contrib_trend = (w_trend.view(1, D, 1, 1) * pred_trend_var).sum(dim=1)  # (B,L,1)
+        contrib_value = (w_value.view(1, D, 1, 1) * pred_value_var).sum(dim=1)  # (B,L,1)
+        
+        pred_raw = pred_M + contrib_trend + contrib_value   # (B,L,1)
 
-        pred_trend = self.trend_expert(H_trend)
-        pred_value = self.value_expert(H_value)
+        # 区间专家, 变量加权
+        H_zone = (w_zone.view(1, D, 1, 1) * H_var).sum(dim=1)   # (B,L,d_model)
+        if self.training and (y_future is not None):
+            self.zone_expert.update_bins_from_labels(y_future)
+        logits_bins = self.zone_expert(H_zone)          # (B,L,K)
+        p_bins = F.softmax(logits_bins, dim=-1)         # (B,L,K)
+        label_bins = self.zone_expert.labels_from_y(y_future) if y_future is not None else None
 
-        # 聚合变量级 gate 得到全局权重
+
         p_global = p_vars.mean(dim=0)                  # (4,)
         g_none  = p_global[0]
         g_trend = p_global[1]
         g_zone  = p_global[2]
         g_value = p_global[3]
 
-        g_trend_b = g_trend.view(1, 1, 1)
-        g_value_b = g_value.view(1, 1, 1)
-
-        pred_raw = pred_M + g_trend_b * pred_trend + g_value_b * pred_value  # (B,L_pred,1)
-        
-        # 区间专家（zone），基于未来窗口的 hidden
-        if self.training and (y_future is not None):
-            self.zone_expert.update_bins_from_labels(y_future)
-        logits_bins = self.zone_expert(H_seq)                  # (B,L_pred,K)
-        p_bins = F.softmax(logits_bins, dim=-1)            # (B,L_pred,K)
-        label_bins = self.zone_expert.labels_from_y(y_future) if y_future is not None else None
-
         aux = {
             "pred_M": pred_M,
-            "pred_trend": pred_trend,
-            "pred_value": pred_value,
+            "pred_trend": contrib_trend,
+            "pred_value": contrib_value,
             "logits_bins": logits_bins,
             "p_bins": p_bins,
             "label_bins": label_bins,
