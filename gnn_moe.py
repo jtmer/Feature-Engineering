@@ -495,17 +495,17 @@ class GNNMoETransformerRegressor(nn.Module):
     def __init__(
         self,
         input_size: int,
-        d_model: int = 128,
+        d_model: int = 256,
         num_heads: int = 4,
         num_layers: int = 4,
-        dim_feedforward: int = 256,
+        dim_feedforward: int = 512,
         dropout: float = 0.1,
         gnn_type: str = "gat",
-        gnn_hidden: int = 64,
+        gnn_hidden: int = 128,
         num_gnn_layers: int = 2,
         num_bins: int = 5,
         downsample_stride: int = 4,
-        moe_hidden: int = 128,
+        moe_hidden: int = 256,
         flags: Optional[ModelFlags] = None,
         posenc: str = "learnable",
     ):
@@ -531,19 +531,24 @@ class GNNMoETransformerRegressor(nn.Module):
 
         # self.y_embed = nn.Linear(1, d_model)
         self.backbone_config = AutoConfig.from_pretrained(
-            'hf_ltm/sundial-base-128m', trust_remote_code=True
+            'thuml/sundial-base-128m', trust_remote_code=True
         )
-        self.backbone_config.use_return_dict = True
+        # self.backbone_config.use_return_dict = True
         self.backbone = AutoModelForCausalLM.from_pretrained(
-            'hf_ltm/sundial-base-128m', trust_remote_code=True, config=self.backbone_config
+            'thuml/sundial-base-128m', trust_remote_code=True, config=self.backbone_config
         )
         for p in self.backbone.parameters():
             p.requires_grad = False
         
-        self.y_embed = SundialPatchEmbedding(self.backbone_config)
+        # self.y_embed = SundialPatchEmbedding(self.backbone_config)
+        self.embedding = self.backbone.model.embed_layer
+        for p in self.embedding.parameters():
+            p.requires_grad = False
+        self.token_hidden_size = self.backbone_config.hidden_size
+        self.patch_len = self.backbone_config.input_token_len  # patch 长度
         
-        # 把 backbone 的标量预测 pred_M 映射到专家空间 (B,L_pred,d_model)
-        self.pred_proj = nn.Linear(1, d_model)
+        # # 把 backbone 的标量预测 pred_M 映射到专家空间 (B,L_pred,d_model)
+        # self.pred_proj = nn.Linear(1, d_model)
 
         # # VSN 可选
         # self.time_linear = nn.Linear(self.D, d_model)
@@ -551,7 +556,7 @@ class GNNMoETransformerRegressor(nn.Module):
 
         # MoE：按变量独立的时序 encoder
         # 每个变量只用自己的标量序列作为输入(后面reshape 成 (B*D, L, 1))
-        self.moe_input_proj = nn.Linear(1, d_model)
+        self.moe_input_proj = nn.Linear(self.token_hidden_size, d_model)
         self.moe_backbone = TransformerBackbone(
             d_in=d_model,
             d_model=d_model,
@@ -578,7 +583,10 @@ class GNNMoETransformerRegressor(nn.Module):
         if self.flags.use_gnn and self.flags.use_moe:
             self.var_gating = VariableGating(gnn_hidden, num_states=4, use_context=True)
             # H 的全局上下文 -> gate context（维度对齐 H_g）
-            self.gate_ctx_proj = nn.Linear(d_model, gnn_hidden)
+            self.gate_ctx_proj = nn.Sequential(
+                nn.Linear(self.backbone_config.hidden_size, d_model),
+                nn.Linear(d_model, gnn_hidden)
+            )
         else:
             self.var_gating = None
             self.gate_ctx_proj = None
@@ -598,23 +606,19 @@ class GNNMoETransformerRegressor(nn.Module):
         E = self.gnn(node_feats, X)  # (D,H_g)
         return E
     
-    def _build_moe_hidden_per_var(self, X: torch.Tensor):
+    def _build_moe_hidden_per_var(self, X_tokens: torch.Tensor, B: int, D: int):
         """
-        X: (B, L_pred, D)
-        return:
-          H_var: (B, D, L_pred, d_model)  # 每个变量自己的 MoE hidden 序列
+        X_tokens: (B*D, L_tok, token_hidden_size) — 经过 Sundial patch embedding 后的 token 序列
+        返回:
+          H_var: (B, D, L_tok, d_model)  # 每个变量自己的 MoE hidden 序列（在 patch 维度上）
         """
-        B, L_pred, D = X.shape
-        assert D == self.D
+        B_D, L_tok, _ = X_tokens.shape
+        assert B_D == B * D
 
-        # (B, L, D) -> (B, D, L, 1)
-        X_var = X.permute(0, 2, 1).unsqueeze(-1).contiguous()   # (B,D,L,1)
+        Z_flat = self.moe_input_proj(X_tokens)         # (B*D,L_tok,d_model)
+        H_flat = self.moe_backbone(Z_flat)             # (B*D,L_tok,d_model)
 
-        X_flat = X_var.view(B * D, L_pred, 1)                   # (B*D,L,1)
-        Z_flat = self.moe_input_proj(X_flat)                    # (B*D,L,d_model)
-        H_flat = self.moe_backbone(Z_flat)                      # (B*D,L,d_model)
-
-        H_var = H_flat.view(B, D, L_pred, -1)                   # (B,D,L,d_model)
+        H_var = H_flat.view(B, D, L_tok, -1)           # (B,D,L_tok,d_model)
         return H_var
 
     def forward(
@@ -644,21 +648,24 @@ class GNNMoETransformerRegressor(nn.Module):
         with torch.no_grad():
             pred_M = self.backbone.generate(
                 y_hist,
-                max_new_tokens=self.backbone_config.test_pred_len,
-                num_samples=self.backbone_config.test_n_sample,
+                max_new_tokens=self.backbone_config.output_token_lens[0],
             ).mean(dim=1)
         if pred_M.dim() == 2:
             pred_M = pred_M.unsqueeze(-1)         # (B, L_pred, 1)
         
         # y 的 embedding 参与 GNN
-        y_ctx_emb = self.y_embed(y_hist)            # (B,L_hist,y_emb_dim)
+        y_ctx_emb = self.embedding(y_hist)            # (B, L_hist_tok, hidden)
         # 全局上下文：先对时间，再对 batch 求平均
-        gate_ctx = y_ctx_emb.mean(dim=1).mean(dim=0)   # (y_emb_dim,)
+        gate_ctx = y_ctx_emb.mean(dim=1).mean(dim=0)   # (hidden,)
         gate_ctx = self.gate_ctx_proj(gate_ctx)         # (H_g)
         
+        X_var = X.permute(0, 2, 1).contiguous()          # (B,D,L_pred)
+        X_flat = X_var.view(B * D, L_pred)               # (B*D,L_pred)
+        X_tokens = self.embedding(X_flat)                # (B*D,L_tok,token_hidden_size)
+        L_tok = X_tokens.size(1)
+        
         # MoE：按变量构建时序 hidden
-        # H_var: (B, D, L_pred, d_model)
-        H_var = self._build_moe_hidden_per_var(X)
+        H_var = self._build_moe_hidden_per_var(X_tokens, B, D)  # (B,D,L_tok,d_model)
 
         # GNN + 变量级 Gate + var_hidden
         # 这里用未来窗口的协变量 X 估计变量 embedding
@@ -677,37 +684,39 @@ class GNNMoETransformerRegressor(nn.Module):
         w_value = p_value * (1.0 - p_none)             # (D,1)
         w_zone  = p_zone  * (1.0 - p_none)             # (D,1)
         
+        
+        
         # 变量级 hidden states：embedding -> expert 空间
         var_h_trend = self.var_trend_proj(E)           # (D,d_model)
         var_h_value = self.var_value_proj(E)           # (D,d_model)
-        v_trend = var_h_trend.view(1, D, 1, -1)   # (1,D,1,C)
-        v_value = var_h_value.view(1, D, 1, -1)   # (1,D,1,C)
+        v_trend = var_h_trend.view(1, D, 1, -1)   # (1,D,1,d_model)
+        v_value = var_h_value.view(1, D, 1, -1)   # (1,D,1,d_model)
         
-        H_trend = H_var + v_trend                 # (B,D,L,C)
-        H_value = H_var + v_value                 # (B,D,L,C)
-        H_trend_flat = H_trend.view(B * D, L_pred, -1)   # (B*D,L,C)
-        H_value_flat = H_value.view(B * D, L_pred, -1)
+        H_trend = H_var + v_trend                        # (B,D,L_tok,d_model)
+        H_value = H_var + v_value                        # (B,D,L_tok,d_model)
+        H_trend_flat = H_trend.view(B * D, L_tok, -1)    # (B*D,L_tok,d_model)
+        H_value_flat = H_value.view(B * D, L_tok, -1)    # (B*D,L_tok,d_model)
         
-        pred_trend_var = self.trend_expert(H_trend_flat).view(B, D, L_pred, 1)    # (B,D,L,1)
-        pred_value_var = self.value_expert(H_value_flat).view(B, D, L_pred, 1)    # (B,D,L,1)
+        pred_trend_var = self.trend_expert(H_trend_flat).view(B, D, L_tok, 1)  # (B,D,L_tok,1)
+        pred_value_var = self.value_expert(H_value_flat).view(B, D, L_tok, 1)  # (B,D,L_tok,1)
 
         # 归一化
         w_trend = w_trend / (w_trend.sum() + 1e-6)  # (D,1)
         w_value = w_value / (w_value.sum() + 1e-6)  # (D,1)
         w_zone = w_zone / (w_zone.sum() + 1e-6)     # (D,1)
 
-        contrib_trend = (w_trend.view(1, D, 1, 1) * pred_trend_var).sum(dim=1)  # (B,L,1)
-        contrib_value = (w_value.view(1, D, 1, 1) * pred_value_var).sum(dim=1)  # (B,L,1)
+        contrib_trend_patch = (w_trend.view(1, D, 1, 1) * pred_trend_var).sum(dim=1)  # (B,L_tok,1)
+        contrib_value_patch = (w_value.view(1, D, 1, 1) * pred_value_var).sum(dim=1)  # (B,L_tok,1)
         
-        pred_raw = pred_M + contrib_trend + contrib_value   # (B,L,1)
+        # pred_raw = pred_M + contrib_trend + contrib_value   # (B,L,1)
 
-        # 区间专家, 变量加权
-        H_zone = (w_zone.view(1, D, 1, 1) * H_var).sum(dim=1)   # (B,L,d_model)
-        if self.training and (y_future is not None):
-            self.zone_expert.update_bins_from_labels(y_future)
-        logits_bins = self.zone_expert(H_zone)          # (B,L,K)
-        p_bins = F.softmax(logits_bins, dim=-1)         # (B,L,K)
-        label_bins = self.zone_expert.labels_from_y(y_future) if y_future is not None else None
+        # # 区间专家, 变量加权
+        # H_zone = (w_zone.view(1, D, 1, 1) * H_var).sum(dim=1)   # (B,L,d_model)
+        # if self.training and (y_future is not None):
+        #     self.zone_expert.update_bins_from_labels(y_future)
+        # logits_bins = self.zone_expert(H_zone)          # (B,L,K)
+        # p_bins = F.softmax(logits_bins, dim=-1)         # (B,L,K)
+        # label_bins = self.zone_expert.labels_from_y(y_future) if y_future is not None else None
 
 
         p_global = p_vars.mean(dim=0)                  # (4,)

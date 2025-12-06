@@ -11,7 +11,12 @@ from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
 # import TransformerClassifier from transformer_classification_withC.py
 
-from gnn_moe_transformer_torch_new import GNNMoETransformerRegressor, ModelFlags, compute_losses, LossWeights
+# from gnn_moe_transformer_torch_new import GNNMoETransformerRegressor, ModelFlags, compute_losses, LossWeights
+from attn_moe_new import (
+    CovAwareVarWisePatchMoERegressor,
+    PatchMoEFlags,
+)
+
 
 # fix random seed for reproducibility
 torch.manual_seed(42)
@@ -268,30 +273,39 @@ output_size = 1
 
 # model = TransformerRegressor(input_size=input_size, num_heads=4, num_layers=4, output_size=output_size, dim_feedforward=128, dropout=0.1)
 # model.to('cuda')
-flags = ModelFlags(
-    use_gnn=True,          # 使用GNN建模协变量
-    use_vsn=False,         # 启用特征选择Variable Selection Network
-    use_trend=True,        # 启用趋势专家
-    use_zone_soft=True,    # 区间分类采用soft限制
-    use_value=True,        # 启用值专家
-    use_moe=True,          # 启用MoE门控
-    graph_mode="learnable" # 学习型图结构
-)
-model = GNNMoETransformerRegressor(
+
+# flags = ModelFlags(
+#     use_gnn=True,          # 使用GNN建模协变量
+#     use_vsn=False,         # 启用特征选择Variable Selection Network
+#     use_trend=True,        # 启用趋势专家
+#     use_zone_soft=True,    # 区间分类采用soft限制
+#     use_value=True,        # 启用值专家
+#     use_moe=True,          # 启用MoE门控
+#     graph_mode="learnable" # 学习型图结构
+# )
+# model = GNNMoETransformerRegressor(
+#     input_size=input_size,
+#     d_model=128, num_heads=4, num_layers=4,
+#     dim_feedforward=256, dropout=0.1,
+#     gnn_type="gat", gnn_hidden=64, num_gnn_layers=2,
+#     num_bins=5, downsample_stride=4, moe_hidden=128,
+#     flags=flags, posenc="learnable"
+# ).to('cuda')
+
+flags = PatchMoEFlags(use_value_expert=True, freeze_backbone=True)
+model = CovAwareVarWisePatchMoERegressor(
     input_size=input_size,
-    d_model=128, num_heads=4, num_layers=4,
-    dim_feedforward=256, dropout=0.1,
-    gnn_type="gat", gnn_hidden=64, num_gnn_layers=2,
-    num_bins=5, downsample_stride=4, moe_hidden=128,
-    flags=flags, posenc="learnable"
+    sundial_name='thuml/sundial-base-128m',
+    flags=flags,
 ).to('cuda')
+lambda_aux = 0.5  # 值域专家监督的权重
 
 # class imbalance handling
 criterion = nn.MSELoss()
 criterion = criterion.cuda() if torch.cuda.is_available() else criterion
 
 epoch_num = 500
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
 
 best_vali_loss = float('inf')
@@ -304,29 +318,57 @@ for epoch in range(epoch_num):
     model.train()
     loss_avg = 0.0
 
+    # for X_batch, y_hist_batch, y_future_batch in train_loader:
+    #     X_batch      = X_batch.float().to(device)          # (B,L_pred,D)
+    #     y_hist_batch = y_hist_batch.float().to(device)     # (B,L_hist,1)
+    #     y_future_batch = y_future_batch.float().to(device) # (B,L_pred,1)
+
+    #     optimizer.zero_grad()
+
+    #     pred, aux = model(X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True)
+
+    #     loss_weights = LossWeights(lv=0.5, lz=0.5, lt=0.2, lc=0.1)
+    #     total_loss, metrics, _ = compute_losses(
+    #         y_future_batch, pred, aux, loss_weights,
+    #         hard_clamp=False,
+    #         bin_edges=model.zone_expert.bin_edges,
+    #         trend_target=model.trend_expert.supervised_target(y_future_batch).detach()
+    #     )
+    #     loss = total_loss
+
+    #     loss_avg += loss.item()
+    #     loss.backward()
+    #     optimizer.step()
+
+    # loss_avg /= len(train_loader)
+    
     for X_batch, y_hist_batch, y_future_batch in train_loader:
-        X_batch      = X_batch.float().to(device)          # (B,L_pred,D)
-        y_hist_batch = y_hist_batch.float().to(device)     # (B,L_hist,1)
-        y_future_batch = y_future_batch.float().to(device) # (B,L_pred,1)
+        X_batch      = X_batch.float().to(device)
+        y_hist_batch = y_hist_batch.float().to(device)
+        y_future_batch = y_future_batch.float().to(device)
 
         optimizer.zero_grad()
 
-        pred, aux = model(X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True)
-
-        loss_weights = LossWeights(lv=0.5, lz=0.5, lt=0.2, lc=0.1)
-        total_loss, metrics, _ = compute_losses(
-            y_future_batch, pred, aux, loss_weights,
-            hard_clamp=False,
-            bin_edges=model.zone_expert.bin_edges,
-            trend_target=model.trend_expert.supervised_target(y_future_batch).detach()
+        pred, aux, aux_loss = model(
+            X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True
         )
-        loss = total_loss
 
-        loss_avg += loss.item()
-        loss.backward()
+        main_loss = criterion_main(
+            pred.reshape(pred.shape[0], -1),
+            y_future_batch.reshape(y_future_batch.shape[0], -1)
+        )
+
+        if aux_loss is not None:
+            total_loss = main_loss + lambda_aux * aux_loss
+        else:
+            total_loss = main_loss
+
+        total_loss.backward()
         optimizer.step()
+        loss_avg += total_loss.item()
 
     loss_avg /= len(train_loader)
+    print(f"Epoch {epoch+1}: train_total_loss={loss_avg:.6f}")
 
     # ===== 验证 =====
     model.eval()
