@@ -5,12 +5,18 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 from transformers import AutoModelForCausalLM, AutoConfig
 from transformers.activations import ACT2FN
 
 from sundial.configuration_sundial import SundialConfig
 from sundial.ts_generation_mixin import TSGenerationMixin
+
+def print_mem(label):
+    alloc = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    print(f"[{label}] allocated = {alloc:.1f} MB, reserved = {reserved:.1f} MB")
 
 class SundialPatchEmbedding(nn.Module):
     def __init__(self, config: SundialConfig):
@@ -161,15 +167,19 @@ class ValueRangeExpertVarWise(nn.Module):
         )
         self.out_mu = nn.Linear(hidden_mlp, 1)
         self.out_logsigma = nn.Linear(hidden_mlp, 1)
+        
+        nn.init.zeros_(self.out_mu.weight)
+        nn.init.zeros_(self.out_mu.bias)
+        nn.init.zeros_(self.out_logsigma.weight)
+        nn.init.zeros_(self.out_logsigma.bias)
 
     def forward(self, H_var: torch.Tensor):
         B, D, Np, H = H_var.shape
         x = H_var.reshape(B * D * Np, H)
         z = self.net(x)
-        mu = self.out_mu(z).view(B, D, Np)
-        log_sigma = self.out_logsigma(z).view(B, D, Np)
-        sigma = F.softplus(log_sigma) + 1e-3
-        return mu, sigma
+        delta_mu = self.out_mu(z).view(B, D, Np)         # (B,D,N_hist)
+        delta_logsigma = self.out_logsigma(z).view(B, D, Np)
+        return delta_mu, delta_logsigma
 
 
 # 变量级 Gate：给每个协变量一个权重
@@ -202,6 +212,8 @@ class VariableGatingSimple(nn.Module):
 class PatchMoEFlags:
     use_value_expert: bool = True
     freeze_backbone: bool = True
+    mu_delta_scale: float = 0.1
+    sigma_delta_scale: float = 0.05 
 
 
 class CovAwareVarWisePatchMoERegressor(nn.Module):
@@ -253,13 +265,22 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
 
         self.data_proc = DataProcessExpert(self.patch_len)
 
-        # cross-attn: Q = y_hist patches, K/V = 各变量的未来协变量 patches
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.hidden_size,
-            num_heads=4,
-            dropout=0.1,
-            batch_first=True,
-        )
+        # Q = y_hist patches, K/V = 各变量的未来协变量 patches
+        # self.cross_attn = nn.MultiheadAttention(
+        #     embed_dim=self.hidden_size,
+        #     num_heads=4,
+        #     dropout=0.1,
+        #     batch_first=True,
+        # )
+        self.num_heads = 4
+        assert self.hidden_size % self.num_heads == 0
+        self.head_dim = self.hidden_size // self.num_heads
+        self.attn_dropout = 0.1
+
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.value_expert = ValueRangeExpertVarWise(self.hidden_size, hidden_mlp=128)
         self.var_gating = VariableGatingSimple(self.hidden_size)
@@ -281,30 +302,59 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
         H_y = self.patch_embed_y(y_hist)          # (B,N_hist,H)
         N_hist = H_y.shape[1]
         ctx_y = H_y.mean(dim=1)                   # (B,H)，给 gate 用
+        
+        # 作为 base stats,专家只在此基础上学残差
+        mu_base_hist, sigma_base_hist = self.data_proc.compute_patch_stats(y_hist)  # (B,N_hist_base)
 
         X_var = X_future.permute(0, 2, 1).contiguous()  # (B,D,L_pred)
         X_flat = X_var.view(B * D, L_pred)              # (B*D,L_pred)
         H_x_flat = self.patch_embed_x(X_flat)           # (B*D,N_future,H)
         N_future = H_x_flat.shape[1]
-
-        # Cross-Attention: Q=H_y, K/V=H_x_j
-        H_y_rep = H_y.repeat_interleave(D, dim=0)       # (B*D,N_hist,H)
-        Q = H_y_rep                                     # (B*D,N_hist,H)
-        K = H_x_flat                                    # (B*D,N_future,H)
+        
+        H_y_rep = H_y.repeat_interleave(D, dim=0)       # (B*D, N_hist, H)
+        Q = H_y_rep                                     # (B*D, N_hist, H)
+        K = H_x_flat                                    # (B*D, N_future, H)
         V = H_x_flat
-        H_attn_flat, _ = self.cross_attn(Q, K, V, need_weights=False)  # (B*D,N_hist,H)
-        H_var_attn = H_attn_flat.view(B, D, N_hist, self.hidden_size)  # (B,D,N_hist,H)
+
+        q = self.q_proj(Q)  # (B*D, N_hist, H)
+        k = self.k_proj(K)  # (B*D, N_future, H)
+        v = self.v_proj(V)  # (B*D, N_future, H)
+
+        BD, N_hist, H = q.shape
+        _, N_future, _ = k.shape
+
+        # (B*D, N, H) -> (B*D, num_heads, N, head_dim)
+        q = q.view(BD, N_hist, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(BD, N_future, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(BD, N_future, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )  # (B*D, num_heads, N_hist, head_dim)
+
+        # 合并多头
+        attn_out = attn_out.transpose(1, 2).contiguous().view(BD, N_hist, H)
+        H_attn_flat = self.out_proj(attn_out)          # (B*D, N_hist, H)
+        H_var_attn = H_attn_flat.view(B, D, N_hist, self.hidden_size)
 
         # 值域专家
-        mu_var_hist, sigma_var_hist = self.value_expert(H_var_attn)    # (B,D,N_hist)
+        delta_mu_var_hist, delta_logsigma_var_hist = self.value_expert(H_var_attn)    # (B,D,N_hist)
 
         # 变量级 gate，得到全局 μ_hist/σ_hist
         E_var = H_var_attn.mean(dim=2)                # (B,D,H)
         gate_logits, w_vars = self.var_gating(E_var, ctx_y)  # w_vars:(B,D)
 
         w_exp = w_vars.unsqueeze(-1)                  # (B,D,1)
-        mu_hist = (w_exp * mu_var_hist).sum(dim=1)    # (B,N_hist)
-        sigma_hist = (w_exp * sigma_var_hist).sum(dim=1)
+        delta_mu_hist = (w_exp * delta_mu_var_hist).sum(dim=1)       # (B,N_hist)
+        delta_logsigma_hist = (w_exp * delta_logsigma_var_hist).sum(dim=1) # (B,N_hist)
+        
+        mu_hist = mu_base_hist + self.flags.mu_delta_scale * delta_mu_hist
+        log_sigma_base = torch.log(sigma_base_hist + 1e-6)           # (B,N_hist)
+        log_sigma_hist = log_sigma_base + self.flags.sigma_delta_scale * delta_logsigma_hist
+        sigma_hist = torch.exp(log_sigma_hist) + 1e-3       # 保证非负！
 
         # DataProcessExpert
         y_hist_norm = self.data_proc.normalize_with_params(
@@ -332,8 +382,12 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
         aux = {
             "H_y": H_y,
             "H_var_attn": H_var_attn,
-            "mu_var_hist": mu_var_hist,
-            "sigma_var_hist": sigma_var_hist,
+            "delta_mu_var_hist": delta_mu_var_hist,
+            "delta_logsigma_var_hist": delta_logsigma_var_hist,
+            "delta_mu_hist": delta_mu_hist,
+            "delta_logsigma_hist": delta_logsigma_hist,
+            "mu_base_hist": mu_base_hist,
+            "sigma_base_hist": sigma_base_hist,
             "mu_hist": mu_hist,
             "sigma_hist": sigma_hist,
             "w_vars": w_vars,
@@ -373,3 +427,70 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
             return y_pred.unsqueeze(-1), aux, aux_loss
         else:
             return y_pred.unsqueeze(-1)
+        
+        
+def param_size_mb(model: torch.nn.Module):
+    total = 0
+    for p in model.parameters():
+        total += p.numel() * p.element_size()
+    return total / 1024**2
+        
+        
+if __name__ == '__main__':
+    from torch.profiler import profile, record_function, ProfilerActivity
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 先清一遍缓存，避免历史占用干扰
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    # ===== 1) 构建一个“小模型 + 小输入” =====
+    # 这里的 input_size 要等于你的协变量个数 D
+    input_size =  128
+    flags = PatchMoEFlags(use_value_expert=True, freeze_backbone=True)
+
+    print_mem("before model")
+
+    model = CovAwareVarWisePatchMoERegressor(
+        input_size=input_size,
+        sundial_name='thuml/sundial-base-128m',
+        flags=flags,
+    ).to(device)
+
+    print_mem("after model.to(cuda)")
+    
+    print(f"Model parameters memory ~= {param_size_mb(model):.1f} MB")
+
+    # 用比正常训练小很多的 window 做一次测试
+    B_small = 64
+    L_hist_small = 2880   # 小历史窗口
+    L_pred_small = 720    # 小预测窗口
+    D = input_size
+
+    X_small = torch.randn(B_small, L_pred_small, D, device=device)
+    y_hist_small = torch.randn(B_small, L_hist_small, 1, device=device)
+    y_future_small = torch.randn(B_small, L_pred_small, 1, device=device)
+
+    torch.cuda.reset_peak_memory_stats()
+    print_mem("before forward")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        profile_memory=True,
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
+        with record_function("model_inference"):
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                y_pred, aux, aux_loss = model(
+                    X_small, y_hist_small, y_future=y_future_small, return_aux=True
+                )
+
+    print(prof.key_averages().table(
+        sort_by="self_cuda_memory_usage",
+        row_limit=20
+    ))
+
+    print_mem("after forward (no grad)")
+    print("peak allocated:", torch.cuda.max_memory_allocated() / 1024**2, "MB")

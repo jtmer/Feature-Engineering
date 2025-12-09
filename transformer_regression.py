@@ -5,6 +5,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 import torch
 import torch.nn as nn
+from torch.amp import autocast
 import sys
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
@@ -187,10 +188,10 @@ target_columns = cols
 cov_cols = target_columns[:-1]
 target_col = target_columns[-1]
 
-train_start = 192 * 160
-train_number = 96 * 600
-vali_number = 96
-test_number = 192 * 2
+train_start = 0
+train_number = 3600 * 15
+vali_number = 3600 * 5
+test_number = 3600 * 8
 
 price_all = data[target_col].values
 X_all = data[cov_cols].values
@@ -232,7 +233,7 @@ train_dataset = PriceLoader(
     scaler_X=scaler_X,
     scaler_y=scaler_y,
     scale=scale,
-    step_size=pred_window
+    step_size=int(pred_window/4)
 )
 
 vali_dataset = PriceLoader(
@@ -247,7 +248,7 @@ vali_dataset = PriceLoader(
     scaler_X=scaler_X,
     scaler_y=scaler_y,
     scale=scale,
-    step_size=pred_window
+    step_size=int(pred_window/4)
 )
 
 test_dataset = PriceLoader(
@@ -262,7 +263,7 @@ test_dataset = PriceLoader(
     scaler_X=scaler_X,
     scaler_y=scaler_y,
     scale=scale,
-    step_size=pred_window
+    step_size=int(pred_window/4)
 )
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
 vali_loader = DataLoader(vali_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
@@ -348,12 +349,13 @@ for epoch in range(epoch_num):
         y_future_batch = y_future_batch.float().to(device)
 
         optimizer.zero_grad()
+        
+        with autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred, aux, aux_loss = model(
+                X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True
+            )
 
-        pred, aux, aux_loss = model(
-            X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True
-        )
-
-        main_loss = criterion_main(
+        main_loss = criterion(
             pred.reshape(pred.shape[0], -1),
             y_future_batch.reshape(y_future_batch.shape[0], -1)
         )
@@ -366,7 +368,12 @@ for epoch in range(epoch_num):
         total_loss.backward()
         optimizer.step()
         loss_avg += total_loss.item()
-
+        
+        
+    if 10 <= epoch and epoch <= 30:
+        print(aux['mu_base_hist'].mean(), aux['mu_hist'].mean())
+        print(aux['sigma_base_hist'].mean(), aux['sigma_hist'].mean())
+        
     loss_avg /= len(train_loader)
     print(f"Epoch {epoch+1}: train_total_loss={loss_avg:.6f}")
 
@@ -379,7 +386,8 @@ for epoch in range(epoch_num):
             y_hist_batch = y_hist_batch.float().to(device)
             y_future_batch = y_future_batch.float().to(device)
 
-            outputs = model(X_batch, y_hist_batch, y_future=y_future_batch)  # (B,L_pred,1)
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(X_batch, y_hist_batch, y_future=y_future_batch)  # (B,L_pred,1)
             loss = criterion(
                 outputs.reshape(outputs.shape[0], -1),
                 y_future_batch.reshape(y_future_batch.shape[0], -1)
@@ -411,21 +419,22 @@ with torch.no_grad():
     y_hist_batch = y_hist_batch.float().to(device)
     y_future_batch = y_future_batch.float().to(device)
 
-    pred, aux = model(X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True)
+    with autocast(device_type="cuda", dtype=torch.bfloat16):
+        pred = model(X_batch, y_hist_batch, y_future=y_future_batch, return_aux=True)
 
-# 如果你启用了 VSN，且希望基于未来窗口的协变量做重要性：
-if model.vsn is not None:
-    Xt_for_vsn = model.time_linear(X_batch)  # (B,L_pred,d_model)
-    w = model.vsn(Xt_for_vsn)                # (B,L_pred,D)
-    importance = w.mean(dim=(0,1)).detach().cpu().numpy()
-    print("Feature importance (VSN):")
-    for i, v in enumerate(importance):
-        print(f"  var{i:02d}: {v:.4f}")
+# # 如果你启用了 VSN，且希望基于未来窗口的协变量做重要性：
+# if model.vsn is not None:
+#     Xt_for_vsn = model.time_linear(X_batch)  # (B,L_pred,d_model)
+#     w = model.vsn(Xt_for_vsn)                # (B,L_pred,D)
+#     importance = w.mean(dim=(0,1)).detach().cpu().numpy()
+#     print("Feature importance (VSN):")
+#     for i, v in enumerate(importance):
+#         print(f"  var{i:02d}: {v:.4f}")
         
-    plt.bar(range(len(importance)), importance)
-    plt.xlabel("Feature index"); plt.ylabel("Importance")
-    plt.title("Variable importance (VSN)")
-    plt.savefig("feature_importance.png")
+#     plt.bar(range(len(importance)), importance)
+#     plt.xlabel("Feature index"); plt.ylabel("Importance")
+#     plt.title("Variable importance (VSN)")
+#     plt.savefig("feature_importance.png")
         
 
 model.load_state_dict(torch.load('best_mlp_regressier.pth', map_location=device))
@@ -440,7 +449,8 @@ with torch.no_grad():
         y_hist_batch = y_hist_batch.float().to(device)
         y_future_batch = y_future_batch.float().to(device)
 
-        outputs = model(X_batch, y_hist_batch, y_future=y_future_batch)  # (1,L_pred,1)
+        with autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(X_batch, y_hist_batch, y_future=y_future_batch)  # (1,L_pred,1)
         all_preds.append(outputs.cpu().numpy().reshape(-1))
         all_labels.append(y_future_batch.cpu().numpy().reshape(-1))
 
@@ -466,6 +476,6 @@ plt.plot(all_labels, label='True Prices', color='blue')
 plt.plot(all_preds, label='Predicted Prices', color='red')
 plt.xlabel('Time Steps')
 plt.ylabel('Price')
-plt.title('GNN+MoE Transformer: True vs Predicted Prices')
+plt.title('Attn_MoE Transformer: True vs Predicted Prices')
 plt.legend()
-plt.savefig('gnn_moe_transformer_results_2_without_vsn.png')
+plt.savefig('attn_moe.png')
