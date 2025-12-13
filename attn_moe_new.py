@@ -84,7 +84,6 @@ class DataProcessExpert(nn.Module):
 
     def compute_patch_stats(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        仅用于辅助监督（用未来 y 的真实 patch 均值/方差
         y: (B, L)
         return:
           mu_true:(B,Np), sigma_true:(B,Np)
@@ -92,6 +91,17 @@ class DataProcessExpert(nn.Module):
         patches, _ = self._patchify(y)
         mu = patches.mean(dim=-1)
         sigma = patches.std(dim=-1) + 1e-3
+        return mu, sigma
+    
+    def compute_global_stats(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        全局均值方差（不按 patch）作为 base stats
+        y: (B, L)
+        return:
+          mu_base:(B,1), sigma_base:(B,1)
+        """
+        mu = y.mean(dim=-1, keepdim=True)
+        sigma = y.std(dim=-1, keepdim=True) + 1e-3
         return mu, sigma
 
     def normalize_with_params(
@@ -114,17 +124,17 @@ class DataProcessExpert(nn.Module):
             y_norm_all = y_norm_all[:, pad_left:]
         return y_norm_all  # (B,L_hist)
 
-    def denormalize_future_with_params(
+    def denormalize_future_with_future_params(
         self,
         y_future_norm: torch.Tensor,  # (B,L_pred)
-        mu_hist: torch.Tensor,        # (B,N_hist)
-        sigma_hist: torch.Tensor,     # (B,N_hist)
+        mu_future: torch.Tensor,      # (B,N_future)
+        sigma_future: torch.Tensor,   # (B,N_future)
         L_pred: int,
     ) -> torch.Tensor:
         """
         对 backbone 输出的标准化预测做逆处理，得到最终预测：
-          y_pred = z * σ_future + μ_future
-        其中 μ_future/σ_future 由 μ_hist/σ_hist 在 patch 维度上线性插值得到。
+        y_pred = z * σ_future + μ_future
+        这里 μ_future/σ_future 是未来 patch 级参数（不再从 hist 插值）。
         """
         B, L = y_future_norm.shape
         assert L == L_pred
@@ -132,18 +142,8 @@ class DataProcessExpert(nn.Module):
         patches_norm, pad_left = self._patchify(y_future_norm)  # (B,N_pred,P)
         B2, N_pred, P = patches_norm.shape
         assert B2 == B
-
-        # μ_hist, σ_hist 在 patch 维度插值到 N_pred
-        if N_pred != mu_hist.shape[1]:
-            mu_future = F.interpolate(
-                mu_hist.unsqueeze(1), size=N_pred, mode="linear", align_corners=False
-            ).squeeze(1)  # (B,N_pred)
-            sigma_future = F.interpolate(
-                sigma_hist.unsqueeze(1), size=N_pred, mode="linear", align_corners=False
-            ).squeeze(1)  # (B,N_pred)
-        else:
-            mu_future = mu_hist
-            sigma_future = sigma_hist
+        assert mu_future.shape[1] == sigma_future.shape[1] == N_pred, \
+            f"N_patch mismatch: N_pred:{N_pred}, mu_future:{mu_future.shape[1]}, sigma_future:{sigma_future.shape[1]}"
 
         y_denorm_patches = patches_norm * sigma_future.unsqueeze(-1) + mu_future.unsqueeze(-1)
         y_denorm_all = y_denorm_patches.reshape(B, N_pred * P)
@@ -183,60 +183,36 @@ class ValueRangeExpertVarWise(nn.Module):
 
 
 # 变量级 Gate：给每个协变量一个权重
-class VariableGatingSimple(nn.Module):
+class VariableGatingPatchWise(nn.Module):
     """
-    E_var:(B,D,H), ctx:(B,H) -> w_vars:(B,D)
+    H_var_attn:(B,D,Np,H) -> w_vars:(B,D,Np)
+    对每个 patch 独立在 D 上 softmax。
     """
     def __init__(self, hidden_size: int):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(2 * hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, E_var: torch.Tensor, ctx: torch.Tensor):
-        B, D, H = E_var.shape
-        ctx_exp = ctx.unsqueeze(1).expand(-1, D, -1)  # (B,D,H)
-        x = torch.cat([E_var, ctx_exp], dim=-1)       # (B,D,2H)
-        logits = self.mlp(x).squeeze(-1)             # (B,D)
-        w = F.softmax(logits, dim=-1)
+    def forward(self, H_var_attn: torch.Tensor):
+        B, D, Np, H = H_var_attn.shape
+        x = H_var_attn.reshape(B * D * Np, H)             # (B*D*Np, H)
+        logits = self.mlp(x).view(B, D, Np)               # (B,D,Np)
+        w = F.softmax(logits, dim=1)                      # softmax over D
         return logits, w
 
-
-# =========================================================
-# 主模型：逐协变量的 Patch-MoE + Sundial backbone
-# =========================================================
 
 @dataclass
 class PatchMoEFlags:
     use_value_expert: bool = True
     freeze_backbone: bool = True
     mu_delta_scale: float = 0.1
-    sigma_delta_scale: float = 0.05 
+    sigma_delta_scale: float = 0.05
 
 
 class CovAwareVarWisePatchMoERegressor(nn.Module):
-    """
-    时序流程（重点）：
-
-      1) 对历史目标 y_hist 做 patch embedding: H_y:(B,N_hist,H)
-      2) 对每个协变量 j 的未来序列 X_future[...,j] 做 patch embedding: H_x_var:(B,D,N_future,H)
-      3) Cross-Attention：
-           Q = H_y（目标 patch）
-           K,V = 每个变量自己的 H_x_var_j（未来协变量 patch）
-         得到 H_var_attn:(B,D,N_hist,H)，即“每个协变量对每个历史 patch 的影响表示”
-      4) 值域专家（逐变量）：
-           H_var_attn -> mu_var_hist,sigma_var_hist:(B,D,N_hist)
-      5) 变量 Gate：
-           w_vars:(B,D)  -> 聚合得到全局 mu_hist,sigma_hist:(B,N_hist)
-      6) DataProcessExpert 用 mu_hist/sigma_hist 对 y_hist 按 patch 变换：
-           y_hist_norm = (y_hist - mu_hist)/sigma_hist
-      7) Sundial backbone 在 y_hist_norm 上生成未来标准化预测 pred_norm:(B,L_pred)
-      8) DataProcessExpert 用“同一组 mu_hist/sigma_hist（在 patch 维度插值到未来）”
-         把 pred_norm 反变换成最终预测 y_pred:(B,L_pred)
-      9) 辅助损失：用 y_future 的真实 patch 均值/方差监督 “插值到未来”的 mu_pred_future/sigma_pred_future
-    """
     def __init__(
         self,
         input_size: int,
@@ -283,7 +259,78 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
         self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.value_expert = ValueRangeExpertVarWise(self.hidden_size, hidden_mlp=128)
-        self.var_gating = VariableGatingSimple(self.hidden_size)
+        self.var_gating = VariableGatingPatchWise(self.hidden_size)
+
+    def _cross_attn(
+        self,
+        Q_in: torch.Tensor,  # (B*, Nq, H)
+        K_in: torch.Tensor,  # (B*, Nk, H)
+        V_in: torch.Tensor,  # (B*, Nk, H)
+    ) -> torch.Tensor:
+        """
+        return: (B*, Nq, H)
+        """
+        q = self.q_proj(Q_in)
+        k = self.k_proj(K_in)
+        v = self.v_proj(V_in)
+
+        Bx, Nq, H = q.shape
+        _, Nk, _ = k.shape
+
+        q = q.view(Bx, Nq, self.num_heads, self.head_dim).transpose(1, 2)  # (B*,h,Nq,hd)
+        k = k.view(Bx, Nk, self.num_heads, self.head_dim).transpose(1, 2)  # (B*,h,Nk,hd)
+        v = v.view(Bx, Nk, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )  # (B*, h, Nq, hd)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(Bx, Nq, H)  # (B*,Nq,H)
+        out = self.out_proj(attn_out)
+        return out
+    
+    def _make_future_base_stats(
+        self,
+        mu_base_hist: torch.Tensor,      # (B,N_hist)
+        sigma_base_hist: torch.Tensor,   # (B,N_hist)
+        N_future: int,
+        trim_ratio: float = 0.1,         # 去掉上下各 10%
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        给 pred 提供一个稳健的 base stats，让模型学习 residual。
+
+        使用 trimmed mean：
+        - 在历史 patch 维度上去掉极端值
+        - 避免 repeat_last 被异常 patch 污染
+        """
+        B, N_hist = mu_base_hist.shape
+        assert 0.0 <= trim_ratio < 0.5
+
+        # 计算截尾区间 ----
+        k = int(N_hist * trim_ratio)
+        if k == 0:
+            # patch 很少时退化为 simple mean
+            mu_center = mu_base_hist.mean(dim=1, keepdim=True)       # (B,1)
+            sigma_center = sigma_base_hist.mean(dim=1, keepdim=True)
+        else:
+            # 排序并截尾 ----
+            mu_sorted, _ = torch.sort(mu_base_hist, dim=1)
+            sigma_sorted, _ = torch.sort(sigma_base_hist, dim=1)
+
+            mu_trim = mu_sorted[:, k:N_hist - k]         # (B, N_hist-2k)
+            sigma_trim = sigma_sorted[:, k:N_hist - k]
+
+            mu_center = mu_trim.mean(dim=1, keepdim=True)     # (B,1)
+            sigma_center = sigma_trim.mean(dim=1, keepdim=True)
+
+        # broadcast 到未来 patch ----
+        mu_base_future = mu_center.repeat(1, N_future)         # (B,N_future)
+        sigma_base_future = sigma_center.repeat(1, N_future)
+
+        return mu_base_future, sigma_base_future
 
     def forward(
         self,
@@ -301,59 +348,37 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
 
         H_y = self.patch_embed_y(y_hist)          # (B,N_hist,H)
         N_hist = H_y.shape[1]
-        ctx_y = H_y.mean(dim=1)                   # (B,H)，给 gate 用
         
         # 作为 base stats,专家只在此基础上学残差
         mu_base_hist, sigma_base_hist = self.data_proc.compute_patch_stats(y_hist)  # (B,N_hist_base)
 
+        # ================================= 前处理 ====================================
         X_var = X_future.permute(0, 2, 1).contiguous()  # (B,D,L_pred)
         X_flat = X_var.view(B * D, L_pred)              # (B*D,L_pred)
         H_x_flat = self.patch_embed_x(X_flat)           # (B*D,N_future,H)
         N_future = H_x_flat.shape[1]
+        H_x_var = H_x_flat.view(B, D, N_future, self.hidden_size)  # (B,D,N_future,H)
         
         H_y_rep = H_y.repeat_interleave(D, dim=0)       # (B*D, N_hist, H)
-        Q = H_y_rep                                     # (B*D, N_hist, H)
-        K = H_x_flat                                    # (B*D, N_future, H)
-        V = H_x_flat
+        Q_hist = H_y_rep                                 # (B*D, N_hist, H)
+        K_hist = H_x_flat                                # (B*D, N_future, H)
+        V_hist = H_x_flat
 
-        q = self.q_proj(Q)  # (B*D, N_hist, H)
-        k = self.k_proj(K)  # (B*D, N_future, H)
-        v = self.v_proj(V)  # (B*D, N_future, H)
-
-        BD, N_hist, H = q.shape
-        _, N_future, _ = k.shape
-
-        # (B*D, N, H) -> (B*D, num_heads, N, head_dim)
-        q = q.view(BD, N_hist, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(BD, N_future, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(BD, N_future, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False,
-        )  # (B*D, num_heads, N_hist, head_dim)
-
-        # 合并多头
-        attn_out = attn_out.transpose(1, 2).contiguous().view(BD, N_hist, H)
-        H_attn_flat = self.out_proj(attn_out)          # (B*D, N_hist, H)
-        H_var_attn = H_attn_flat.view(B, D, N_hist, self.hidden_size)
+        H_attn_hist_flat = self._cross_attn(Q_hist, K_hist, V_hist)     # (B*D,N_hist,H)
+        H_var_attn_hist = H_attn_hist_flat.view(B, D, N_hist, self.hidden_size)
 
         # 值域专家
-        delta_mu_var_hist, delta_logsigma_var_hist = self.value_expert(H_var_attn)    # (B,D,N_hist)
+        delta_mu_var_hist, delta_logsigma_var_hist = self.value_expert(H_var_attn_hist)  # (B,D,N_hist)
 
-        # 变量级 gate，得到全局 μ_hist/σ_hist
-        E_var = H_var_attn.mean(dim=2)                # (B,D,H)
-        gate_logits, w_vars = self.var_gating(E_var, ctx_y)  # w_vars:(B,D)
+        # 变量级 gate
+        gate_logits_hist, w_vars_hist = self.var_gating(H_var_attn_hist)  # softmax over D
 
-        w_exp = w_vars.unsqueeze(-1)                  # (B,D,1)
-        delta_mu_hist = (w_exp * delta_mu_var_hist).sum(dim=1)       # (B,N_hist)
-        delta_logsigma_hist = (w_exp * delta_logsigma_var_hist).sum(dim=1) # (B,N_hist)
+        delta_mu_hist = (w_vars_hist * delta_mu_var_hist).sum(dim=1)                 # (B,N_hist)
+        delta_logsigma_hist = (w_vars_hist * delta_logsigma_var_hist).sum(dim=1)     # (B,N_hist)
         
         mu_hist = mu_base_hist + self.flags.mu_delta_scale * delta_mu_hist
-        log_sigma_base = torch.log(sigma_base_hist + 1e-6)           # (B,N_hist)
-        log_sigma_hist = log_sigma_base + self.flags.sigma_delta_scale * delta_logsigma_hist
+        log_sigma_base_hist = torch.log(sigma_base_hist + 1e-6)
+        log_sigma_hist = log_sigma_base_hist + self.flags.sigma_delta_scale * delta_logsigma_hist
         sigma_hist = torch.exp(log_sigma_hist) + 1e-3       # 保证非负！
 
         # DataProcessExpert
@@ -371,48 +396,101 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
             pred_norm = pred_norm.unsqueeze(0)
         pred_norm = pred_norm[:, :L_pred]             # (B,L_pred)
 
+        # ====================================== 后处理 ============================================
+        Q_fut = H_x_flat                        # (B*D,N_future,H)
+        K_fut = H_y_rep                         # (B*D,N_hist,H)
+        V_fut = H_y_rep
+
+        H_attn_fut_flat = self._cross_attn(Q_fut, K_fut, V_fut)         # (B*D,N_future,H)
+        H_var_attn_future = H_attn_fut_flat.view(B, D, N_future, self.hidden_size)
+
+        # 值域专家（future）
+        delta_mu_var_future, delta_logsigma_var_future = self.value_expert(H_var_attn_future)  # (B,D,N_future)
+
+        # Patch-level gate（future）
+        gate_logits_future, w_vars_future = self.var_gating(H_var_attn_future)  # (B,D,N_future)
+
+        delta_mu_future = (w_vars_future * delta_mu_var_future).sum(dim=1)                 # (B,N_future)
+        delta_logsigma_future = (w_vars_future * delta_logsigma_var_future).sum(dim=1)     # (B,N_future)
+
+        # future base stats
+        mu_base_future, sigma_base_future = self._make_future_base_stats(
+            mu_base_hist=mu_base_hist,
+            sigma_base_hist=sigma_base_hist,
+            N_future=N_future,
+        )
+        mu_future = mu_base_future + self.flags.mu_delta_scale * delta_mu_future
+        log_sigma_base_future = torch.log(sigma_base_future + 1e-6)
+        log_sigma_future = log_sigma_base_future + self.flags.sigma_delta_scale * delta_logsigma_future
+        sigma_future = torch.exp(log_sigma_future) + 1e-3
+
         # 逆处理
-        y_pred = self.data_proc.denormalize_future_with_params(
+        y_pred = self.data_proc.denormalize_future_with_future_params(
             y_future_norm=pred_norm,
-            mu_hist=mu_hist,
-            sigma_hist=sigma_hist,
+            mu_future=mu_future,
+            sigma_future=sigma_future,
             L_pred=L_pred,
-        )                                              # (B,L_pred)
+        )  # (B,L_pred)
 
         aux = {
             "H_y": H_y,
-            "H_var_attn": H_var_attn,
+            "H_x_var": H_x_var,
+            "H_var_attn_hist": H_var_attn_hist,
+            "H_var_attn_future": H_var_attn_future,
+
             "delta_mu_var_hist": delta_mu_var_hist,
             "delta_logsigma_var_hist": delta_logsigma_var_hist,
             "delta_mu_hist": delta_mu_hist,
             "delta_logsigma_hist": delta_logsigma_hist,
+
+            "delta_mu_var_future": delta_mu_var_future,
+            "delta_logsigma_var_future": delta_logsigma_var_future,
+            "delta_mu_future": delta_mu_future,
+            "delta_logsigma_future": delta_logsigma_future,
+
             "mu_base_hist": mu_base_hist,
             "sigma_base_hist": sigma_base_hist,
             "mu_hist": mu_hist,
             "sigma_hist": sigma_hist,
-            "w_vars": w_vars,
-            "gate_logits": gate_logits,
+
+            "mu_base_future": mu_base_future,
+            "sigma_base_future": sigma_base_future,
+            "mu_future": mu_future,
+            "sigma_future": sigma_future,
+
+            "w_vars_hist": w_vars_hist,
+            "gate_logits_hist": gate_logits_hist,
+            "w_vars_future": w_vars_future,
+            "gate_logits_future": gate_logits_future,
+
             "y_hist_norm": y_hist_norm,
             "pred_norm": pred_norm,
         }
-
+                
         aux_loss = None
         if self.training and (y_future is not None):
-            # y_future 的真实 patch 统计
             mu_true_fut, sigma_true_fut = self.data_proc.compute_patch_stats(y_future)  # (B,N_true)
             N_true = mu_true_fut.shape[1]
 
-            # 把 μ_hist/σ_hist 在 patch 维度插值到未来 patch 数 N_true
-            mu_pred_fut = F.interpolate(
-                mu_hist.unsqueeze(1), size=N_true, mode="linear", align_corners=False
-            ).squeeze(1)  # (B,N_true)
-            sigma_pred_fut = F.interpolate(
-                sigma_hist.unsqueeze(1), size=N_true, mode="linear", align_corners=False
-            ).squeeze(1)
+            N_min = min(N_future, N_true)
+            mu_pred_fut = mu_future[:, :N_min]
+            sigma_pred_fut = sigma_future[:, :N_min]
+            mu_true_fut = mu_true_fut[:, :N_min]
+            sigma_true_fut = sigma_true_fut[:, :N_min]
 
             loss_mu = F.mse_loss(mu_pred_fut, mu_true_fut)
             loss_sigma = F.mse_loss(sigma_pred_fut, sigma_true_fut)
             aux_loss = loss_mu + loss_sigma
+            
+            loss_gate_cons = None
+            gate_consistency_detach_hist = 0.05
+            wbar_hist = w_vars_hist.mean(dim=2)     # (B,D)
+            wbar_fut  = w_vars_future.mean(dim=2)   # (B,D)
+
+            wbar_hist_tgt = wbar_hist.detach()
+            loss_gate_cons = F.mse_loss(wbar_fut, wbar_hist_tgt)
+
+            aux_loss = aux_loss + gate_consistency_detach_hist * loss_gate_cons
 
             aux.update({
                 "mu_true_fut": mu_true_fut,
@@ -421,6 +499,9 @@ class CovAwareVarWisePatchMoERegressor(nn.Module):
                 "sigma_pred_fut": sigma_pred_fut,
                 "aux_loss_mu": loss_mu.detach().item(),
                 "aux_loss_sigma": loss_sigma.detach().item(),
+                "aux_loss_gate_cons": loss_gate_cons.detach().item(),
+                "wbar_hist": wbar_hist.detach(),
+                "wbar_fut": wbar_fut.detach(),
             })
 
         if return_aux:

@@ -191,7 +191,7 @@ target_col = target_columns[-1]
 train_start = 0
 train_number = 3600 * 15
 vali_number = 3600 * 5
-test_number = 3600 * 8
+test_number = 3600 * 1
 
 price_all = data[target_col].values
 X_all = data[cov_cols].values
@@ -265,7 +265,7 @@ test_dataset = PriceLoader(
     scale=scale,
     step_size=int(pred_window/4)
 )
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
 vali_loader = DataLoader(vali_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
 
@@ -294,11 +294,21 @@ output_size = 1
 # ).to('cuda')
 
 flags = PatchMoEFlags(use_value_expert=True, freeze_backbone=True)
+
 model = CovAwareVarWisePatchMoERegressor(
     input_size=input_size,
     sundial_name='thuml/sundial-base-128m',
     flags=flags,
 ).to('cuda')
+
+# from transformers import AutoModelForCausalLM, AutoConfig
+# backbone_config = AutoConfig.from_pretrained(
+#     "thuml/sundial-base-128m", trust_remote_code=True
+# )
+# model = AutoModelForCausalLM.from_pretrained(
+# "thuml/sundial-base-128m", trust_remote_code=True, config=backbone_config
+# ).to('cuda')
+
 lambda_aux = 0.5  # 值域专家监督的权重
 
 # class imbalance handling
@@ -451,6 +461,10 @@ with torch.no_grad():
 
         with autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(X_batch, y_hist_batch, y_future=y_future_batch)  # (1,L_pred,1)
+            # outputs = model.generate(
+            #     y_hist_batch.squeeze(-1),
+            #     max_new_tokens=backbone_config.output_token_lens[0],
+            # ).mean(dim=1)
         all_preds.append(outputs.cpu().numpy().reshape(-1))
         all_labels.append(y_future_batch.cpu().numpy().reshape(-1))
 
