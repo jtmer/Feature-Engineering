@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+
+[project]
+name = "AdaPTS"
+authors = [
+  {name = "Abdelhakim Benechehab", email = "abdelhakim.benechehab@gmail.com"},
+  {name = "Vasilii Feofanov", email = "vasilii.feofanov@huawei.com"},
+  {name = "Giuseppe Paolo", email = "giuseppe.g.paolo@gmail.com"},
+  {name = "Albert Thomas", email = "albertthomas88@gmail.com"},
+  {name = "Maurizio Filippone", email = "maurizio.filippone@kaust.edu.sa"},
+  {name = "Balázs Kégl", email = "balazs.kegl@gmail.com"},
+]
+maintainers = [
+  {name = "Abdelhakim Benechehab", email = "abdelhakim.benechehab@gmail.com"},
+]
+dynamic = ["version", "readme", "dependencies"]
+description = "AdaPTS: Adapting Univariate Foundation Models to Probabilistic Multivariate Time Series Forecasting."
+requires-python = ">=3.9"
+keywords = ["Multivariate time series forecasting", "Foundation models", "Probabilistic inference"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3.10",
+  "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[project.optional-dependencies]
+dev = ['ruff', 'pre-commit', 'black']
+hyperopt = ['gpy==1.13.2', 'ray[tune]==2.40.0', 'hebo==0.3.6']
+
+[tool.setuptools]
+license-files = ['LICEN[CS]E*', 'COPYING*', 'NOTICE*', 'AUTHORS*']
+
+[project.scripts]
+
+[tool.setuptools.dynamic]
+readme = { file = ["README.md"] }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools_scm]
+
+[tool.ruff]
+line-length = 88
