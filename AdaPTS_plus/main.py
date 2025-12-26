@@ -11,7 +11,7 @@ sys.path.insert(0, adapts_repo_root)
 
 from adapts.icl.sundial import SundialICLTrainer
 
-from conditional_adapters import ConditionalPatchVAEAdapter, ConditionalPatchPCAAdapter
+from conditional_adapters import ConditionalPatchVAEAdapter, ConditionalPatchPCAAdapter, NeuralTimeAdapter
 from conditional_adapts import ConditionalAdaPTS
 
 def normalize_cov_per_sample(x: np.ndarray, eps: float = 1e-5):
@@ -60,6 +60,8 @@ X_train_raw = X_all[train_start:train_end]
 print("X_train_raw min/mean/max:", np.nanmin(X_train_raw), np.nanmean(X_train_raw), np.nanmax(X_train_raw))
 print("Any inf?", np.isinf(X_train_raw).any(), "Any nan?", np.isnan(X_train_raw).any())
 
+
+# TODO 是否去掉
 def scale_xy(x_cov: np.ndarray, y: np.ndarray):
     x = scaler_X.transform(x_cov)
     
@@ -69,6 +71,8 @@ def scale_xy(x_cov: np.ndarray, y: np.ndarray):
     return x.astype(np.float32), yy.astype(np.float32)
 
 X_all_s, y_all_s = scale_xy(X_all, price_all)
+
+
 
 def make_windows(x_cov: np.ndarray, y: np.ndarray, L: int, H: int, stride: int = 1):
     """
@@ -152,27 +156,48 @@ assert hist_window % patch_size == 0 and pred_window % patch_size == 0, "L/H mus
 # )
 # coeff_kl = 1.0
 
-adapter = ConditionalPatchPCAAdapter(
-    cov_dim=cov_dim,
-    z_dim=z_dim,
-    patch_size=patch_size,
+# adapter = ConditionalPatchPCAAdapter(
+#     cov_dim=cov_dim,
+#     z_dim=z_dim,
+#     patch_size=patch_size,
+#     hidden_dim=256,
+#     dec_layers=2,
+# )
+# adapter.fit_pca(y_p_tr, x_p_tr)
+
+adapter = NeuralTimeAdapter(
+    covariates_dim=cov_dim,
+    latent_dim=z_dim,
     hidden_dim=256,
-    dec_layers=2,
+    encoder_layers=2,
+    decoder_layers=2,
+    dropout=0.0,
 )
-adapter.fit_pca(y_p_tr, x_p_tr)
 
 coeff_kl = 0.0
 
 model2 = ConditionalAdaPTS(adapter=adapter, iclearner=iclearner, device=device)
-model2.train_adapter_reconstruct_past(
-    y_past=y_p_tr,
-    x_past=x_p_tr,
+# model2.train_adapter_reconstruct_past(
+#     y_past=y_p_tr,
+#     x_past=x_p_tr,
+#     n_epochs=30,
+#     batch_size=128,
+#     lr=1e-3,
+#     coeff_recon=1.0,
+#     coeff_kl=coeff_kl,
+#     verbose=1,
+# )
+model2.train_adapter(
+    past_target=y_p_tr,
+    past_covariates=x_p_tr,
+    future_target=y_f_tr,
+    future_covariates=x_f_tr,
     n_epochs=30,
     batch_size=128,
     lr=1e-3,
-    coeff_recon=1.0,
-    coeff_kl=coeff_kl,
-    verbose=1,
+    lambda_past_recon=1.0,
+    lambda_ltm_consistency=1.0,
+    verbose=True,
 )
 
 # =====================测试
@@ -186,17 +211,17 @@ perm = np.random.permutation(B)
 x_future_shuffle = x_future_true[perm]
 
 pack_true = model2.predict(
-    y_past=y_p_te[:B], x_past=x_p_te[:B], x_future=x_future_true,
+    past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_true,
     pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
 )
 
 pack_zero = model2.predict(
-    y_past=y_p_te[:B], x_past=x_p_te[:B], x_future=x_future_zero,
+    past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_zero,
     pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
 )
 
 pack_shuf = model2.predict(
-    y_past=y_p_te[:B], x_past=x_p_te[:B], x_future=x_future_shuffle,
+    past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_shuffle,
     pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
 )
 
@@ -227,9 +252,9 @@ x_p_te   = normalize_cov_per_sample(x_p_te[:B].copy())
 
 # 推理：用真 x_future
 pack = model2.predict(
-    y_past=y_p_te[:256],
-    x_past=x_p_te[:256],
-    x_future=x_f_te[:256],   # 推理阶段：如果没有 future cov，就先用 cov-forecaster 产出
+    past_target=y_p_te[:256],
+    past_covariates=x_p_te[:256],
+    future_covariates=x_f_te[:256],
     pred_horizon=pred_window,
     fm_batch_size=128,
     n_samples=30,

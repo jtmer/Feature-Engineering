@@ -20,15 +20,10 @@ class PredPack:
 
 
 class ConditionalAdaPTS:
-    """
-    - 训练 adapter: y_past,x_past -> z_past -> decode(z_past,x_past) 重建 y_past
-    - 推理:  y_past,x_past -> z_past -> FM(z_past)-> z_future_pred -> decode(z_future_pred, x_future) -> y_future_pred
-    """
-
     def __init__(
         self,
-        adapter: nn.Module,          # ConditionalPatchVAEAdapter
-        iclearner,                   # adapts.icl.iclearner.* (MomentICLTrainer / MoiraiICLTrainer)
+        adapter: nn.Module,
+        iclearner,
         device: str = "cpu",
     ):
         self.adapter = adapter
@@ -37,124 +32,226 @@ class ConditionalAdaPTS:
         self.adapter.to(self.device)
 
     @torch.no_grad()
-    def _fm_predict_z(self, z_past: torch.Tensor, horizon_tokens: int, batch_size: int = 64, **kwargs) -> torch.Tensor:
-        self.iclearner.update_context(
-            time_series=copy.copy(z_past),
-            context_length=z_past.shape[-1],
-        )
-        icl_objs = self.iclearner.predict_long_horizon(
-            prediction_horizon=horizon_tokens,
-            batch_size=batch_size,
-            verbose=0,
-            **kwargs,
-        )
-
-        preds = []
-        Cz = z_past.shape[1]
-        for k in range(Cz):
-            p = icl_objs[k].predictions  # 你 trainer 保证是 torch.Tensor (B,1,H)
-            p = p.to(self.device, dtype=torch.float32)
-
-            # 对齐长度（保险）
-            if p.shape[-1] > horizon_tokens:
-                p = p[..., :horizon_tokens]
-            elif p.shape[-1] < horizon_tokens:
-                pad = horizon_tokens - p.shape[-1]
-                p = torch.nn.functional.pad(p, (0, pad))
-
-            preds.append(p)
-
-        z_future = torch.cat(preds, dim=1)  # (B,Cz,Htok)
-        return z_future
-
-    def train_adapter_reconstruct_past(
+    def _predict_future_latents_with_ltm(
         self,
-        y_past: np.ndarray,   # (N,1,L)
-        x_past: np.ndarray,   # (N,Cx,L)
+        past_latents: torch.Tensor,          # (B, z_dim, L)
+        future_horizon: int,                # H
+        ltm_batch_size: int = 64,
+        **ltm_kwargs,
+    ) -> torch.Tensor:
+        """
+        return: future_latents_pred (B, z_dim, H)
+        """
+        self.iclearner.update_context(
+            time_series=copy.copy(past_latents),
+            context_length=past_latents.shape[-1],
+        )
+
+        per_channel_outputs = self.iclearner.predict_long_horizon(
+            prediction_horizon=future_horizon,
+            batch_size=ltm_batch_size,
+            verbose=0,
+            **ltm_kwargs,
+        )
+
+        predicted_channels = []
+        num_latent_channels = past_latents.shape[1]
+
+        for channel_idx in range(num_latent_channels):
+            channel_pred = per_channel_outputs[channel_idx].predictions  # torch.Tensor (B,1,H) in your trainer
+            channel_pred = channel_pred.to(self.device, dtype=torch.float32)
+
+            # safety: force length match
+            if channel_pred.shape[-1] > future_horizon:
+                channel_pred = channel_pred[..., :future_horizon]
+            elif channel_pred.shape[-1] < future_horizon:
+                pad_len = future_horizon - channel_pred.shape[-1]
+                channel_pred = F.pad(channel_pred, (0, pad_len))
+
+            predicted_channels.append(channel_pred)
+
+        future_latents_pred = torch.cat(predicted_channels, dim=1)  # (B, z_dim, H)
+        return future_latents_pred
+
+    # def train_adapter_reconstruct_past(
+    #     self,
+    #     y_past: np.ndarray,   # (N,1,L)
+    #     x_past: np.ndarray,   # (N,Cx,L)
+    #     n_epochs: int = 50,
+    #     batch_size: int = 64,
+    #     lr: float = 1e-3,
+    #     weight_decay: float = 0.0,
+    #     coeff_recon: float = 1.0,
+    #     coeff_kl: float = 1.0,
+    #     verbose: int = 1,
+    # ):
+    #     ds = TensorDataset(
+    #         torch.tensor(y_past, dtype=torch.float32),
+    #         torch.tensor(x_past, dtype=torch.float32),
+    #     )
+    #     dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    #     self.adapter.train()
+    #     opt = torch.optim.Adam(self.adapter.parameters(), lr=lr, weight_decay=weight_decay)
+
+    #     for ep in range(n_epochs):
+    #         total = 0.0
+    #         for yb, xb in dl:
+    #             yb = yb.to(self.device)
+    #             xb = xb.to(self.device)
+
+    #             out = self.adapter.encode(yb, xb)
+    #             y_hat = self.adapter.decode(out.z, xb)
+
+    #             recon = F.mse_loss(y_hat, yb)
+    #             loss = coeff_recon * recon + coeff_kl * out.kl
+
+    #             opt.zero_grad()
+    #             loss.backward()
+    #             opt.step()
+    #             total += loss.item() * yb.size(0)
+
+    #         if verbose:
+    #             print(f"[adapter-pretrain] epoch={ep:03d} loss={total/len(ds):.6f}")
+    
+    def train_adapter(
+        self,
+        past_target: np.ndarray,        # (N,1,L)   y_past
+        past_covariates: np.ndarray,    # (N,Cx,L)  x_past
+        future_target: np.ndarray,      # (N,1,H)   y_future
+        future_covariates: np.ndarray,  # (N,Cx,H)  x_future
         n_epochs: int = 50,
         batch_size: int = 64,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
-        coeff_recon: float = 1.0,
-        coeff_kl: float = 1.0,    # 这里 adapter 内部已有 beta_kl；再乘一层方便你扫参
-        verbose: int = 1,
+        lambda_past_recon: float = 1.0,
+        lambda_ltm_consistency: float = 1.0,
+        ltm_batch_size: int = 1,
+        verbose: bool = True,
     ):
-        ds = TensorDataset(
-            torch.tensor(y_past, dtype=torch.float32),
-            torch.tensor(x_past, dtype=torch.float32),
+        """
+        1) 重建:  y_past ≈ decode( encode(y_past,x_past), x_past )
+        2) 分布一致:  encode(y_future,x_future) ≈ LTM( encode(y_past,x_past) )
+        """
+
+        dataset = TensorDataset(
+            torch.tensor(past_target, dtype=torch.float32),
+            torch.tensor(past_covariates, dtype=torch.float32),
+            torch.tensor(future_target, dtype=torch.float32),
+            torch.tensor(future_covariates, dtype=torch.float32),
         )
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         self.adapter.train()
-        opt = torch.optim.Adam(self.adapter.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(self.adapter.parameters(), lr=lr, weight_decay=weight_decay)
 
-        for ep in range(n_epochs):
-            total = 0.0
-            for yb, xb in dl:
-                yb = yb.to(self.device)
-                xb = xb.to(self.device)
+        # LTM frozen
+        self.iclearner.eval()
 
-                out = self.adapter.encode(yb, xb)
-                y_hat = self.adapter.decode(out.z, xb)
+        for epoch in range(n_epochs):
+            epoch_loss_sum = 0.0
 
-                recon = F.mse_loss(y_hat, yb)
-                loss = coeff_recon * recon + coeff_kl * out.kl
+            last_loss_past = 0.0
+            last_loss_future_teacher = 0.0
+            last_loss_ltm = 0.0
 
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                total += loss.item() * yb.size(0)
+            for (
+                batch_past_target,
+                batch_past_covariates,
+                batch_future_target,
+                batch_future_covariates,
+            ) in dataloader:
+
+                batch_past_target = batch_past_target.to(self.device)
+                batch_past_covariates = batch_past_covariates.to(self.device)
+
+                past_latents = self.adapter.encode(batch_past_target, batch_past_covariates)
+                future_latents_true = self.adapter.encode(batch_future_target, batch_future_covariates)
+
+                # past reconstruction
+                past_target_recon = self.adapter.decode(past_latents, batch_past_covariates)
+                loss_past_recon = F.mse_loss(past_target_recon, batch_past_target)
+
+                # LTM consistency ----
+                with torch.no_grad():
+                    future_latents_pred = self._predict_future_latents_with_ltm(
+                        past_latents=past_latents,
+                        future_horizon=batch_future_target.shape[-1],
+                        ltm_batch_size=ltm_batch_size,
+                    )
+                    
+                # TODO 这里mse点对点的loss是否不太对？改成对均值、方差等统计量的约束怎么样？
+                loss_ltm_consistency = F.mse_loss(future_latents_pred, future_latents_true)
+
+                total_loss = (
+                    lambda_past_recon * loss_past_recon
+                    + lambda_ltm_consistency * loss_ltm_consistency
+                )
+
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                epoch_loss_sum += total_loss.item() * batch_past_target.size(0)
+
+                last_loss_past = loss_past_recon.item()
+                last_loss_ltm = loss_ltm_consistency.item()
 
             if verbose:
-                print(f"[adapter-pretrain] epoch={ep:03d} loss={total/len(ds):.6f}")
+                epoch_loss = epoch_loss_sum / len(dataset)
+                print(
+                    f"[adapter-train] epoch={epoch:03d} "
+                    f"loss={epoch_loss:.6f} "
+                    f"past_recon={last_loss_past:.4f} "
+                    f"ltm_consistency={last_loss_ltm:.4f}"
+                )
 
     def predict(
         self,
-        y_past: np.ndarray,          # (B,1,L)
-        x_past: np.ndarray,          # (B,Cx,L)
-        x_future: np.ndarray,        # (B,Cx,H)  (如果没有未来协变量，你可以先用 cov forecaster 产出)
-        pred_horizon: int,           # H (timestep)
-        fm_batch_size: int = 128,
+        past_target: np.ndarray,        # (B,1,L)
+        past_covariates: np.ndarray,    # (B,Cx,L)
+        future_covariates: np.ndarray,  # (B,Cx,H)
+        pred_horizon: int,              # H
+        ltm_batch_size: int = 128,
         n_samples: int = 20,
-        **fm_kwargs,
+        **ltm_kwargs,
     ) -> PredPack:
 
-        self.adapter.train()  # 为了让 VAE 的采样产生不确定性（类似你原版用 dropout 采样）:contentReference[oaicite:3]{index=3}
+        self.adapter.train()   # keep stochasticity if adapter has dropout etc.
         self.iclearner.eval()
 
-        y_past_t = torch.tensor(y_past, dtype=torch.float32, device=self.device)
-        x_past_t = torch.tensor(x_past, dtype=torch.float32, device=self.device)
-        x_future_t = torch.tensor(x_future, dtype=torch.float32, device=self.device)
+        past_target_tensor = torch.tensor(past_target, dtype=torch.float32, device=self.device)
+        past_covariates_tensor = torch.tensor(past_covariates, dtype=torch.float32, device=self.device)
+        future_covariates_tensor = torch.tensor(future_covariates, dtype=torch.float32, device=self.device)
 
-        # token horizon：如果 patch_size>1，FM 预测的是 token 数 = H//P
-        patch_size = getattr(self.adapter, "patch_size", 1)
-        if patch_size > 1:
-            assert pred_horizon % patch_size == 0
-            horizon_tokens = pred_horizon // patch_size
-        else:
-            horizon_tokens = pred_horizon
+        all_future_target_samples = []
 
-        all_y = []
-        for _ in range(n_samples):
+        for sample_idx in range(n_samples):
             with torch.no_grad():
-                out = self.adapter.encode(y_past_t, x_past_t)              # z_past
-                z_future = self._fm_predict_z(out.z, horizon_tokens, batch_size=fm_batch_size, **fm_kwargs)
-                
-                if _ == 0:  # 第一次采样打印
-                    print("\n==== z stats ====")
-                    print("z_past  min/mean/max:", out.z.min().item(), out.z.mean().item(), out.z.max().item())
-                    print("z_past  std:", out.z.std().item())
-                    print("x_future min/mean/max:", x_future_t.min().item(), x_future_t.mean().item(), x_future_t.max().item())
-                    print("z_future min/mean/max:", z_future.min().item(), z_future.mean().item(), z_future.max().item())
-                    print("z_future std:", z_future.std().item())
-                
-                
-                y_future_hat = self.adapter.decode(z_future, x_future_t)   # (B,1,H)
-                all_y.append(y_future_hat.detach().cpu().numpy())
+                past_latent_out = self.adapter.encode(past_target_tensor, past_covariates_tensor)
+                past_latents = past_latent_out
 
-        all_y = np.stack(all_y, axis=0)  # (S,B,1,H)
-        mean = all_y.mean(axis=0)
-        std = all_y.std(axis=0)
+                future_latents_pred = self._predict_future_latents_with_ltm(
+                    past_latents=past_latents,
+                    future_horizon=pred_horizon,
+                    ltm_batch_size=ltm_batch_size,
+                    **ltm_kwargs,
+                )
+
+                if sample_idx == 0:
+                    print("\n==== latent stats ====")
+                    print("past_latents   min/mean/max:", past_latents.min().item(), past_latents.mean().item(), past_latents.max().item())
+                    print("past_latents   std:", past_latents.std().item())
+                    print("future_cov     min/mean/max:", future_covariates_tensor.min().item(), future_covariates_tensor.mean().item(), future_covariates_tensor.max().item())
+                    print("future_latents min/mean/max:", future_latents_pred.min().item(), future_latents_pred.mean().item(), future_latents_pred.max().item())
+                    print("future_latents std:", future_latents_pred.std().item())
+
+                future_target_pred = self.adapter.decode(future_latents_pred, future_covariates_tensor)  # (B,1,H)
+                all_future_target_samples.append(future_target_pred.detach().cpu().numpy())
+
+        all_future_target_samples = np.stack(all_future_target_samples, axis=0)  # (S,B,1,H)
+        mean = all_future_target_samples.mean(axis=0)
+        std = all_future_target_samples.std(axis=0)
         lb = mean - std
         ub = mean + std
         return PredPack(mean=mean, lb=lb, ub=ub)

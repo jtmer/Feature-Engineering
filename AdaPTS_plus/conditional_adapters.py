@@ -248,3 +248,88 @@ class ConditionalPatchPCAAdapter(nn.Module):
         y_hat = self.y_head(h).view(B, Np, self.patch_size).reshape(B, 1, Np * self.patch_size)  # (B,1,L)
         # y_hat = unpatchify(y_tok, self.patch_size)  # (B,1,L)
         return y_hat
+    
+class NeuralTimeAdapter(nn.Module):
+    """
+    - encode: (y, x) -> z
+    - decode: (z, x) -> y_hat
+    """
+    def __init__(
+        self,
+        covariates_dim: int,      # Cx
+        latent_dim: int,          # Cz
+        hidden_dim: int = 256,
+        encoder_layers: int = 2,
+        decoder_layers: int = 2,
+        dropout: float = 0.0,
+        normalize_latents: bool = False,
+    ):
+        super().__init__()
+
+        self.covariates_dim = covariates_dim
+        self.latent_dim = latent_dim
+        self.patch_size = 1  # keep compatibility with previous pipeline
+
+        encoder_input_channels = 1 + covariates_dim
+        decoder_input_channels = latent_dim + covariates_dim
+
+        def build_pointwise_mlp(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
+            layers = []
+            channels = input_channels
+            for _ in range(max(1, num_layers - 1)):
+                layers.append(nn.Conv1d(channels, hidden_dim, kernel_size=1))
+                layers.append(nn.GELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                channels = hidden_dim
+            layers.append(nn.Conv1d(channels, output_channels, kernel_size=1))
+            return nn.Sequential(*layers)
+
+        # (B, 1+Cx, L) -> (B, z_dim, L)
+        self.latent_encoder = build_pointwise_mlp(
+            input_channels=encoder_input_channels,
+            output_channels=latent_dim,
+            num_layers=encoder_layers,
+        )
+
+        # (B, z_dim+Cx, L) -> (B, 1, L)
+        self.target_decoder = build_pointwise_mlp(
+            input_channels=decoder_input_channels,
+            output_channels=1,
+            num_layers=decoder_layers,
+        )
+
+        # TODO 测试加不加的效果如何
+        self.normalize_latents = normalize_latents
+        self.latent_normalizer = (
+            nn.GroupNorm(num_groups=1, num_channels=latent_dim) if normalize_latents else nn.Identity()
+        )
+
+    def encode(self, target_series: torch.Tensor, covariates_series: torch.Tensor):
+        """
+        target_series:     (B,1,L)
+        covariates_series: (B,Cx,L)
+        returns latents:   (B,Cz,L)
+        """
+        device = next(self.parameters()).device
+        target_series = target_series.to(device)
+        covariates_series = covariates_series.to(device)
+        
+        encoder_inputs = torch.cat([target_series, covariates_series], dim=1)  # (B,1+Cx,L)
+        latent_series = self.latent_encoder(encoder_inputs)                    # (B,Cz,L)
+        latent_series = self.latent_normalizer(latent_series)
+        return latent_series
+
+    def decode(self, latent_series: torch.Tensor, covariates_series: torch.Tensor):
+        """
+        latent_series:     (B,Cz,L)
+        covariates_series: (B,Cx,L)
+        returns target_hat:(B,1,L)
+        """
+        device = next(self.parameters()).device
+        latent_series = latent_series.to(device)
+        covariates_series = covariates_series.to(device)
+        
+        decoder_inputs = torch.cat([latent_series, covariates_series], dim=1)  # (B,Cz+Cx,L)
+        target_hat = self.target_decoder(decoder_inputs)                       # (B,1,L)
+        return target_hat
