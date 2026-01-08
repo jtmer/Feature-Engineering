@@ -52,6 +52,10 @@ pred_window = 720
 scaler_X = StandardScaler().fit(X_all[train_start:train_end])
 scaler_y = StandardScaler().fit(price_all[train_start:train_end].reshape(-1, 1))
 
+print("train raw mean:", price_all[train_start:train_end].mean())
+print("val   raw mean:", price_all[val_start:val_end].mean())
+print("test  raw mean:", price_all[test_start:test_end].mean())
+
 stds = scaler_X.scale_
 print("scaler_X std min/median/max:", stds.min(), np.median(stds), stds.max())
 print("num near-zero std cols:", np.sum(stds < 1e-6))
@@ -65,14 +69,13 @@ print("Any inf?", np.isinf(X_train_raw).any(), "Any nan?", np.isnan(X_train_raw)
 def scale_xy(x_cov: np.ndarray, y: np.ndarray):
     x = scaler_X.transform(x_cov)
     
-    x = np.clip(x, -10.0, 10.0)
+    x = np.clip(x, -20.0, 20.0)
     
     yy = scaler_y.transform(y.reshape(-1,1)).reshape(-1)
     return x.astype(np.float32), yy.astype(np.float32)
 
 X_all_s, y_all_s = scale_xy(X_all, price_all)
-
-
+# X_all_s, y_all_s = X_all, price_all
 
 def make_windows(x_cov: np.ndarray, y: np.ndarray, L: int, H: int, stride: int = 1):
     """
@@ -109,20 +112,31 @@ y_p_tr, x_p_tr, x_f_tr, y_f_tr = make_windows(
 # 验证集
 y_p_va, x_p_va, x_f_va, y_f_va = make_windows(
     X_all_s[val_start:val_end], y_all_s[val_start:val_end],
-    hist_window, pred_window, stride
+    hist_window, pred_window, int(stride/6)
 )
 # 测试集
 y_p_te, x_p_te, x_f_te, y_f_te = make_windows(
     X_all_s[test_start:test_end], y_all_s[test_start:test_end],
-    hist_window, pred_window, stride
+    hist_window, pred_window, int(stride/6)
 )
 
-x_p_tr = normalize_cov_per_sample(x_p_tr)
-x_p_va = normalize_cov_per_sample(x_p_va)
+
+# # ====== ablation: no covariates (all zeros) ======
+# x_p_tr = np.zeros_like(x_p_tr)
+# x_f_tr = np.zeros_like(x_f_tr)
+
+# x_p_va = np.zeros_like(x_p_va)
+# x_f_va = np.zeros_like(x_f_va)
+
+# x_p_te = np.zeros_like(x_p_te)
+# x_f_te = np.zeros_like(x_f_te)
+
+# x_p_tr = normalize_cov_per_sample(x_p_tr)
+# x_p_va = normalize_cov_per_sample(x_p_va)
 
 
 seed = 13
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
 
 model_name = "thuml/sundial-base-128m"
@@ -166,8 +180,11 @@ assert hist_window % patch_size == 0 and pred_window % patch_size == 0, "L/H mus
 # adapter.fit_pca(y_p_tr, x_p_tr)
 
 adapter = NeuralTimeAdapter(
+    # covariates_dim=cov_dim+2,
     covariates_dim=cov_dim,
     latent_dim=z_dim,
+    revin_patch_size_past=24,
+    revin_patch_size_future=24,
     hidden_dim=256,
     encoder_layers=2,
     decoder_layers=2,
@@ -181,23 +198,55 @@ model2 = ConditionalAdaPTS(adapter=adapter, iclearner=iclearner, device=device)
 #     y_past=y_p_tr,
 #     x_past=x_p_tr,
 #     n_epochs=30,
-#     batch_size=128,
+#     batch_size=32,
 #     lr=1e-3,
 #     coeff_recon=1.0,
 #     coeff_kl=coeff_kl,
 #     verbose=1,
 # )
+
+import swanlab
+run = swanlab.init(
+    project="conditional-adapts",
+    experiment_name=f"patch{patch_size}_z{z_dim}",
+    config={
+        "hist_window": hist_window,
+        "pred_window": pred_window,
+        "z_dim": z_dim,
+        "lr": 1e-3,
+        "batch_size": 32,
+        "lambda_past": 1.0,
+        "lambda_future": 1.0,
+        "lambda_stats": 0.01,
+        "lambda_stats_pred": 0.1,
+        "revin_patch_past": 24,
+        "revin_patch_future": 24,
+    }
+)
+
+val_data = dict(
+    past_target=y_p_va,
+    past_covariates=x_p_va,
+    future_target=y_f_va,
+    future_covariates=x_f_va,
+)
 model2.train_adapter(
     past_target=y_p_tr,
     past_covariates=x_p_tr,
     future_target=y_f_tr,
     future_covariates=x_f_tr,
-    n_epochs=30,
-    batch_size=128,
+    n_epochs=45,
+    batch_size=32,
     lr=1e-3,
-    lambda_past_recon=1.0,
-    lambda_ltm_consistency=1.0,
+    weight_decay=1e-4,
+    lambda_past_recon=0.6,
+    lambda_future_pred=1.0,
+    lambda_latent_stats=0.01,
+    lambda_stats_pred=0.2,
+    val_data=val_data,
     verbose=True,
+    use_swanlab=True,
+    swanlab_run=run,
 )
 
 # =====================测试
@@ -212,17 +261,17 @@ x_future_shuffle = x_future_true[perm]
 
 pack_true = model2.predict(
     past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_true,
-    pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
+    pred_horizon=pred_window, fm_batch_size=32, n_samples=30,
 )
 
 pack_zero = model2.predict(
     past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_zero,
-    pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
+    pred_horizon=pred_window, fm_batch_size=32, n_samples=30,
 )
 
 pack_shuf = model2.predict(
     past_target=y_p_te[:B], past_covariates=x_p_te[:B], future_covariates=x_future_shuffle,
-    pred_horizon=pred_window, fm_batch_size=128, n_samples=30,
+    pred_horizon=pred_window, fm_batch_size=32, n_samples=30,
 )
 
 mean_true = pack_true.mean[:, 0, :]  # (B,H) scaled
@@ -247,8 +296,8 @@ print("MAE(pred_true, pred_shuf):", float(delta_true_shuf))
 # =====================测试
 
 
-x_f_te = normalize_cov_per_sample(x_f_te[:B].copy())
-x_p_te   = normalize_cov_per_sample(x_p_te[:B].copy())
+# x_f_te = normalize_cov_per_sample(x_f_te[:B].copy())
+# x_p_te   = normalize_cov_per_sample(x_p_te[:B].copy())
 
 # 推理：用真 x_future
 pack = model2.predict(
@@ -256,7 +305,7 @@ pack = model2.predict(
     past_covariates=x_p_te[:256],
     future_covariates=x_f_te[:256],
     pred_horizon=pred_window,
-    fm_batch_size=128,
+    fm_batch_size=32,
     n_samples=30,
 )
 

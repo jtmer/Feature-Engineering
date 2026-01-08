@@ -10,6 +10,58 @@ import torch.nn.functional as F
 from sklearn.decomposition import PCA
 
 
+def revin_patch_stats_target(target_series: torch.Tensor, patch_size: int, eps: float = 1e-5):
+    """
+    y: (B,1,T)
+    return:
+      mu_t:   (B,1,T)   expanded per timestep
+      std_t:  (B,1,T)
+      mu_p:   (B,1,Np)  per patch
+      std_p:  (B,1,Np)
+    """
+    assert target_series.dim() == 3 and target_series.size(1) == 1
+    B, _, T = target_series.shape
+    assert T % patch_size == 0, f"T={T} must be divisible by patch_size={patch_size}"
+    Np = T // patch_size
+
+    y4 = target_series.view(B, 1, Np, patch_size)             # (B,1,Np,P)
+    mu_p = y4.mean(dim=-1)                                    # (B,1,Np)
+    std_p = y4.std(dim=-1)                                    # (B,1,Np)
+
+    mu_t = mu_p.unsqueeze(-1).repeat(1, 1, 1, patch_size).view(B, 1, T)
+    std_t = std_p.unsqueeze(-1).repeat(1, 1, 1, patch_size).view(B, 1, T)
+
+    std_t = std_t + eps
+    std_p = std_p + eps
+    return mu_t, std_t, mu_p, std_p
+
+def revin_patch_norm_target(target_series: torch.Tensor, patch_size: int, eps: float = 1e-5):
+    """
+    target_series: (B,1,T)
+    returns:
+      target_norm: (B,1,T)
+      mu_t/std_t:  (B,1,T)
+      mu_p/std_p:  (B,1,Np)
+    """
+    mu_t, std_t, mu_p, std_p = revin_patch_stats_target(target_series, patch_size, eps=eps)
+    target_norm = (target_series - mu_t) / std_t
+    return target_norm, mu_t, std_t, mu_p, std_p
+
+
+def revin_patch_denorm_target(target_norm: torch.Tensor, mu_t: torch.Tensor, std_t: torch.Tensor):
+    return target_norm * std_t + mu_t
+
+
+def expand_patch_to_time(patch_vals: torch.Tensor, patch_size: int, T: int):
+    """
+    patch_vals: (B,1,Np)
+    return:     (B,1,T)
+    """
+    B, C, Np = patch_vals.shape
+    assert C == 1
+    assert Np * patch_size == T
+    return patch_vals.unsqueeze(-1).repeat(1, 1, 1, patch_size).view(B, 1, T)
+
 def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     """
     x: (B, C, L)
@@ -63,6 +115,32 @@ class MLP(nn.Module):
 class AdapterOutput:
     z: torch.Tensor                 # (B, Cz, Lz or Np)
     kl: torch.Tensor                # scalar
+
+class PatchStatsPredictor(nn.Module):
+    """
+    用协变量预测目标变量在 patch 粒度上的均值/方差位置
+    - 输入:  covariates_series (B,Cx,T)
+    - 输出:  mu_patch/std_patch (B,1,Np)
+    """
+    def __init__(self, cov_dim: int, patch_size: int, hidden_dim: int = 128):
+        super().__init__()
+        self.cov_dim = cov_dim
+        self.patch_size = patch_size
+
+        # (B,Cx,T) -> (B,hidden,Np)
+        self.down = nn.Conv1d(cov_dim, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        self.act = nn.GELU()
+        # (B,hidden,Np) -> (B,2,Np) :即 [mu, logstd]
+        self.head = nn.Conv1d(hidden_dim, 2, kernel_size=1)
+
+    def forward(self, covariates_series: torch.Tensor, eps: float = 1e-5):
+        h = self.act(self.down(covariates_series))
+        out = self.head(h)                         # (B,2,Np)
+        mu_patch = out[:, 0:1, :]
+        logstd_patch = out[:, 1:2, :]
+        logstd_patch = torch.clamp(logstd_patch, min=-2.0, max=1.0)
+        std_patch = torch.exp(logstd_patch) + eps
+        return mu_patch, std_patch, logstd_patch
 
 
 class ConditionalPatchVAEAdapter(nn.Module):
@@ -258,20 +336,27 @@ class NeuralTimeAdapter(nn.Module):
         self,
         covariates_dim: int,      # Cx
         latent_dim: int,          # Cz
+        revin_patch_size_past: int,
+        revin_patch_size_future: int,
         hidden_dim: int = 256,
         encoder_layers: int = 2,
         decoder_layers: int = 2,
         dropout: float = 0.0,
         normalize_latents: bool = False,
+        stats_hidden_dim: int = 128,
     ):
         super().__init__()
 
         self.covariates_dim = covariates_dim
         self.latent_dim = latent_dim
-        self.patch_size = 1  # keep compatibility with previous pipeline
+        
+        # self.patch_size = 1  # keep compatibility with previous pipeline
+        self.revin_patch_size_past = revin_patch_size_past
+        self.revin_patch_size_future = revin_patch_size_future
+        covariates_dim_aug = covariates_dim + 2
 
-        encoder_input_channels = 1 + covariates_dim
-        decoder_input_channels = latent_dim + covariates_dim
+        encoder_input_channels = 1 + covariates_dim_aug
+        decoder_input_channels = latent_dim + covariates_dim_aug
 
         def build_pointwise_mlp(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
             layers = []
@@ -299,10 +384,20 @@ class NeuralTimeAdapter(nn.Module):
             num_layers=decoder_layers,
         )
 
-        # TODO 测试加不加的效果如何
         self.normalize_latents = normalize_latents
         self.latent_normalizer = (
             nn.GroupNorm(num_groups=1, num_channels=latent_dim) if normalize_latents else nn.Identity()
+        )
+        
+        self.future_stats_predictor = PatchStatsPredictor(
+            cov_dim=covariates_dim,
+            patch_size=revin_patch_size_future,
+            hidden_dim=stats_hidden_dim,
+        )
+        self.past_stats_predictor = PatchStatsPredictor(
+            cov_dim=covariates_dim,
+            patch_size=revin_patch_size_past,
+            hidden_dim=stats_hidden_dim,
         )
 
     def encode(self, target_series: torch.Tensor, covariates_series: torch.Tensor):
@@ -333,3 +428,17 @@ class NeuralTimeAdapter(nn.Module):
         decoder_inputs = torch.cat([latent_series, covariates_series], dim=1)  # (B,Cz+Cx,L)
         target_hat = self.target_decoder(decoder_inputs)                       # (B,1,L)
         return target_hat
+    
+    def predict_future_stats(self, future_covariates: torch.Tensor):
+        """
+        future_covariates: (B,Cx,H)
+        return:
+          mu_t_hat/std_t_hat: (B,1,H)
+          mu_patch_hat/std_patch_hat: (B,1,Np)
+        """
+        mu_patch_hat, std_patch_hat, logstd_patch_hat = self.future_stats_predictor(future_covariates)
+        H = future_covariates.shape[-1]
+        P = self.revin_patch_size_future
+        mu_t_hat = expand_patch_to_time(mu_patch_hat, P, H)
+        std_t_hat = expand_patch_to_time(std_patch_hat, P, H)
+        return mu_t_hat, std_t_hat, mu_patch_hat, std_patch_hat, logstd_patch_hat
