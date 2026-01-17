@@ -116,31 +116,146 @@ class AdapterOutput:
     z: torch.Tensor                 # (B, Cz, Lz or Np)
     kl: torch.Tensor                # scalar
 
+# class PatchStatsPredictor(nn.Module):
+#     """
+#     用协变量预测目标变量在 patch 粒度上的均值/方差位置
+#     - 输入:  covariates_series (B,Cx,T)
+#     - 输出:  mu_patch/std_patch (B,1,Np)
+#     """
+#     def __init__(self, cov_dim: int, patch_size: int, hidden_dim: int = 128):
+#         super().__init__()
+#         self.cov_dim = cov_dim
+#         self.patch_size = patch_size
+
+#         # (B,Cx,T) -> (B,hidden,Np)
+#         self.down = nn.Conv1d(cov_dim, hidden_dim, kernel_size=patch_size, stride=patch_size)
+#         self.act = nn.GELU()
+#         # (B,hidden,Np) -> (B,2,Np) :即 [mu, logstd]
+#         self.head = nn.Conv1d(hidden_dim, 2, kernel_size=1)
+
+#     def forward(self, covariates_series: torch.Tensor, eps: float = 1e-5):
+#         """
+#         return:
+#           mu_patch:      (B,1,Np)
+#           std_patch:     (B,1,Np)  > 0
+#           logstd_patch:  (B,1,Np)  = log(std_patch)
+#         """
+#         h = self.act(self.down(covariates_series))
+#         out = self.head(h)                         # (B,2,Np)
+
+#         mu_patch = out[:, 0:1, :]
+#         raw_std = out[:, 1:2, :]
+#         std_patch = F.softplus(raw_std) + eps      # (B,1,Np), >= eps
+#         logstd_patch = torch.log(std_patch + eps)
+#         return mu_patch, std_patch, logstd_patch
+    
 class PatchStatsPredictor(nn.Module):
-    """
-    用协变量预测目标变量在 patch 粒度上的均值/方差位置
-    - 输入:  covariates_series (B,Cx,T)
-    - 输出:  mu_patch/std_patch (B,1,Np)
-    """
-    def __init__(self, cov_dim: int, patch_size: int, hidden_dim: int = 128):
+    def __init__(
+        self,
+        cov_dim: int,
+        patch_size: int,
+        hidden_dim: int = 128,
+        context_layers: int = 2,
+        stats_hidden_dim: int | None = None,
+        logstd_min: float = -4.0,
+        logstd_max: float = 2.0,
+    ):
         super().__init__()
         self.cov_dim = cov_dim
         self.patch_size = patch_size
+        self.logstd_min = logstd_min
+        self.logstd_max = logstd_max
+
+        if stats_hidden_dim is None:
+            stats_hidden_dim = hidden_dim // 2
 
         # (B,Cx,T) -> (B,hidden,Np)
-        self.down = nn.Conv1d(cov_dim, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        self.down = nn.Conv1d(
+            in_channels=cov_dim,
+            out_channels=hidden_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
         self.act = nn.GELU()
-        # (B,hidden,Np) -> (B,2,Np) :即 [mu, logstd]
-        self.head = nn.Conv1d(hidden_dim, 2, kernel_size=1)
+
+        # 对每个 patch 内做 mean/std/max/min
+        # (B,Cx,T) -> (B,4*Cx,Np) -> (B,stats_hidden_dim,Np)
+        self.stats_proj = nn.Conv1d(
+            in_channels=4 * cov_dim,
+            out_channels=stats_hidden_dim,
+            kernel_size=1,
+        )
+
+        # 在 Np 维度上做 kernel=3 的 conv
+        context_channels = hidden_dim + stats_hidden_dim
+        context_blocks = []
+        in_ch = context_channels
+        for _ in range(max(1, context_layers)):
+            context_blocks.append(
+                nn.Conv1d(
+                    in_channels=in_ch,
+                    out_channels=context_channels,
+                    kernel_size=3,
+                    padding=1,
+                )
+            )
+            context_blocks.append(nn.GELU())
+            in_ch = context_channels
+        self.context_net = nn.Sequential(*context_blocks)
+
+        self.mu_head = nn.Conv1d(context_channels, 1, kernel_size=1)
+        self.logstd_head = nn.Conv1d(context_channels, 1, kernel_size=1)
+
+    def _compute_patch_stats(self, covariates_series: torch.Tensor, eps: float = 1e-5):
+        """
+        covariates_series: (B,Cx,T)
+        返回 per-patch 的 mean/std/max/min 拼在 channel 维:
+          (B,4*Cx,Np)
+        """
+        B, Cx, T = covariates_series.shape
+        P = self.patch_size
+        assert T % P == 0, f"T={T} must be divisible by patch_size={P}"
+        Np = T // P
+
+        # (B,Cx,T) -> (B,Cx,Np,P)
+        x4 = covariates_series.view(B, Cx, Np, P)
+
+        mean_p = x4.mean(dim=-1)                 # (B,Cx,Np)
+        std_p  = x4.std(dim=-1) + eps            # (B,Cx,Np)
+        max_p  = x4.max(dim=-1).values           # (B,Cx,Np)
+        min_p  = x4.min(dim=-1).values           # (B,Cx,Np)
+
+        # 堆成 (B,4,Cx,Np) 再合并成 channel 维 (B,4*Cx,Np)
+        stats = torch.stack([mean_p, std_p, max_p, min_p], dim=2)  # (B,4,Cx,Np)
+        stats = stats.view(B, 4 * Cx, Np)                          # (B,4*Cx,Np)
+        return stats
 
     def forward(self, covariates_series: torch.Tensor, eps: float = 1e-5):
-        h = self.act(self.down(covariates_series))
-        out = self.head(h)                         # (B,2,Np)
-        mu_patch = out[:, 0:1, :]
-        logstd_patch = out[:, 1:2, :]
-        logstd_patch = torch.clamp(logstd_patch, min=-2.0, max=1.0)
-        std_patch = torch.exp(logstd_patch) + eps
-        return mu_patch, std_patch, logstd_patch
+        """
+        return:
+          mu_patch:      (B,1,Np)
+          std_patch:     (B,1,Np)  > 0
+          logstd_patch:  (B,1,Np)  = log(std_patch)
+        """
+        B, Cx, T = covariates_series.shape
+        P = self.patch_size
+        assert T % P == 0, f"T={T} must be divisible by patch_size={P}"
+        Np = T // P
+
+        h_down = self.act(self.down(covariates_series))  # (B,hidden,Np)
+
+        stats_raw = self._compute_patch_stats(covariates_series, eps=eps)  # (B,4*Cx,Np)
+        stats_feat = self.act(self.stats_proj(stats_raw))                  # (B,stats_hidden_dim,Np)
+
+        h = torch.cat([h_down, stats_feat], dim=1)  # (B,hidden+stats_hidden_dim,Np)
+        h = self.context_net(h)                     # (B,context_channels,Np)
+
+        mu_patch = self.mu_head(h)                 # (B,1,Np)
+        logstd_raw = self.logstd_head(h)           # (B,1,Np)
+        logstd_clamped = torch.clamp(logstd_raw, min=self.logstd_min, max=self.logstd_max)
+
+        std_patch = torch.exp(logstd_clamped) + eps  # (B,1,Np), > 0
+        return mu_patch, std_patch, logstd_clamped
 
 
 class ConditionalPatchVAEAdapter(nn.Module):
@@ -353,7 +468,8 @@ class NeuralTimeAdapter(nn.Module):
         # self.patch_size = 1  # keep compatibility with previous pipeline
         self.revin_patch_size_past = revin_patch_size_past
         self.revin_patch_size_future = revin_patch_size_future
-        covariates_dim_aug = covariates_dim + 2
+        # covariates_dim_aug = covariates_dim + 2
+        covariates_dim_aug = covariates_dim
 
         encoder_input_channels = 1 + covariates_dim_aug
         decoder_input_channels = latent_dim + covariates_dim_aug
@@ -424,6 +540,7 @@ class NeuralTimeAdapter(nn.Module):
         device = next(self.parameters()).device
         latent_series = latent_series.to(device)
         covariates_series = covariates_series.to(device)
+        latent_series = self.latent_normalizer(latent_series)
         
         decoder_inputs = torch.cat([latent_series, covariates_series], dim=1)  # (B,Cz+Cx,L)
         target_hat = self.target_decoder(decoder_inputs)                       # (B,1,L)

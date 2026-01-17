@@ -13,6 +13,8 @@ from adapts.icl.sundial import SundialICLTrainer
 
 from conditional_adapters import ConditionalPatchVAEAdapter, ConditionalPatchPCAAdapter, NeuralTimeAdapter
 from conditional_adapts import ConditionalAdaPTS
+from conditional_adapters_easy import SmoothPatchAdapter
+from conditional_adapts_easy import SimplePatchAdaPTS
 
 def normalize_cov_per_sample(x: np.ndarray, eps: float = 1e-5):
     # x: (B, C, T)
@@ -154,30 +156,9 @@ iclearner = SundialICLTrainer(
 
 cov_dim = x_p_tr.shape[1]
 # patch_size = 16
-patch_size = 1
+patch_size = 24
 
 assert hist_window % patch_size == 0 and pred_window % patch_size == 0, "L/H must be divisible by patch_size"
-
-# adapter = ConditionalPatchVAEAdapter(
-#     cov_dim=cov_dim,
-#     z_dim=z_dim,
-#     patch_size=patch_size,
-#     hidden_dim=256,
-#     enc_layers=2,
-#     dec_layers=2,
-#     beta_kl=1.0,
-#     dropout=0.0,
-# )
-# coeff_kl = 1.0
-
-# adapter = ConditionalPatchPCAAdapter(
-#     cov_dim=cov_dim,
-#     z_dim=z_dim,
-#     patch_size=patch_size,
-#     hidden_dim=256,
-#     dec_layers=2,
-# )
-# adapter.fit_pca(y_p_tr, x_p_tr)
 
 adapter = NeuralTimeAdapter(
     # covariates_dim=cov_dim+2,
@@ -189,40 +170,23 @@ adapter = NeuralTimeAdapter(
     encoder_layers=2,
     decoder_layers=2,
     dropout=0.0,
+    stats_hidden_dim=256,
+    normalize_latents=True
 )
+# adapter = SmoothPatchAdapter(
+#     cov_dim=cov_dim,
+#     z_dim=z_dim,
+#     patch_size=patch_size,
+#     hidden_dim=256,
+#     enc_layers=2,
+#     dec_layers=2,
+#     dropout=0.0,
+# )
 
 coeff_kl = 0.0
 
 model2 = ConditionalAdaPTS(adapter=adapter, iclearner=iclearner, device=device)
-# model2.train_adapter_reconstruct_past(
-#     y_past=y_p_tr,
-#     x_past=x_p_tr,
-#     n_epochs=30,
-#     batch_size=32,
-#     lr=1e-3,
-#     coeff_recon=1.0,
-#     coeff_kl=coeff_kl,
-#     verbose=1,
-# )
-
-import swanlab
-run = swanlab.init(
-    project="conditional-adapts",
-    experiment_name=f"patch{patch_size}_z{z_dim}",
-    config={
-        "hist_window": hist_window,
-        "pred_window": pred_window,
-        "z_dim": z_dim,
-        "lr": 1e-3,
-        "batch_size": 32,
-        "lambda_past": 1.0,
-        "lambda_future": 1.0,
-        "lambda_stats": 0.01,
-        "lambda_stats_pred": 0.1,
-        "revin_patch_past": 24,
-        "revin_patch_future": 24,
-    }
-)
+# model2 = SimplePatchAdaPTS(adapter=adapter, iclearner=iclearner, device=device)
 
 val_data = dict(
     past_target=y_p_va,
@@ -230,24 +194,64 @@ val_data = dict(
     future_target=y_f_va,
     future_covariates=x_f_va,
 )
+print(">>> Pretrain future_stats_predictor ...")
+stats_val_data = dict(
+    future_target=y_f_va,
+    future_covariates=x_f_va,
+)
+model2.pretrain_stats_predictor(
+    future_target=y_f_tr,      # (N,1,H)
+    future_covariates=x_f_tr,  # (N,Cx,H)
+    n_epochs=100,
+    batch_size=64,
+    lr=1e-4,
+    weight_decay=1e-4,
+    patience=20,
+    val_data=stats_val_data,
+    verbose=True,
+    use_swanlab=False,
+    # swanlab_run=run,
+)
+# for p in adapter.future_stats_predictor.parameters():
+#     p.requires_grad = False
+print(">>> Done pretraining stats predictor.")
 model2.train_adapter(
     past_target=y_p_tr,
     past_covariates=x_p_tr,
     future_target=y_f_tr,
     future_covariates=x_f_tr,
-    n_epochs=45,
+    n_epochs=100,
     batch_size=32,
-    lr=1e-3,
+    lr=1e-4,
     weight_decay=1e-4,
-    lambda_past_recon=0.6,
-    lambda_future_pred=1.0,
-    lambda_latent_stats=0.01,
-    lambda_stats_pred=0.2,
+    lambda_past_recon=0.4,
+    lambda_future_pred=2.0,
+    lambda_latent_stats=0,
+    lambda_stats_pred=0.4,
+    lambda_y_patch_std=0,
     val_data=val_data,
     verbose=True,
-    use_swanlab=True,
-    swanlab_run=run,
+    use_swanlab=False,
+    # swanlab_run=run,
 )
+# model2.train_adapter(
+#     past_target=y_p_tr,
+#     past_covariates=x_p_tr,
+#     future_target=y_f_tr,
+#     future_covariates=x_f_tr,
+#     n_epochs=100,
+#     batch_size=32,
+#     lr=1e-4,
+#     weight_decay=1e-4,
+#     lambda_past_recon=0.6,
+#     lambda_future_pred=1.0,
+#     lambda_latent_smooth=0.1,
+#     lambda_latent_align=0.1,
+#     ltm_batch_size=32,
+#     val_data=val_data,
+#     verbose=True,
+#     use_swanlab=False,
+# )
 
 # =====================测试
 B = min(256, y_p_te.shape[0])
@@ -327,7 +331,10 @@ print("true_y (scaled)   min/mean/max:", float(true_y.min()), float(true_y.mean(
 mean_y_inv = scaler_y.inverse_transform(mean_y.reshape(-1,1)).reshape(mean_y.shape)
 true_y_inv = scaler_y.inverse_transform(true_y.reshape(-1,1)).reshape(true_y.shape)
 
+print("shape:")
 print("mean_y_inv:", mean_y_inv.shape, "true_y_inv:", true_y_inv.shape)
+print("前10个预测值（inverse scale）:")
+print(mean_y_inv[0, :10], true_y_inv[0, :10])
 
 
 import matplotlib.pyplot as plt
