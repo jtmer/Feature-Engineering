@@ -9,9 +9,9 @@ adapts_repo_root = "/data/mahaoke/AdaPTS"
 import sys
 sys.path.insert(0, adapts_repo_root)
 
-from adapts.icl.sundial import SundialICLTrainer
+from sundial.iclearner_sundial import SundialICLTrainer
 
-from conditional_adapters import ConditionalPatchVAEAdapter, ConditionalPatchPCAAdapter, NeuralTimeAdapter
+from conditional_adapters import NeuralTimeAdapter
 from conditional_adapts import ConditionalAdaPTS
 from conditional_adapters_easy import SmoothPatchAdapter
 from conditional_adapts_easy import SimplePatchAdaPTS
@@ -139,13 +139,15 @@ y_p_te, x_p_te, x_f_te, y_f_te = make_windows(
 
 seed = 13
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(device)
 torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
 
 model_name = "thuml/sundial-base-128m"
 forecast_horizon = pred_window
 
 # 注意：此处 n_features = z_dim（代理通道数），因为 FM 是在代理空间做预测
-z_dim = 12
+# z_dim = 12
+z_dim = 1
 iclearner = SundialICLTrainer(
     sundial_name=model_name,
     n_features=z_dim,
@@ -156,7 +158,7 @@ iclearner = SundialICLTrainer(
 
 cov_dim = x_p_tr.shape[1]
 # patch_size = 16
-patch_size = 24
+patch_size = 16
 
 assert hist_window % patch_size == 0 and pred_window % patch_size == 0, "L/H must be divisible by patch_size"
 
@@ -164,8 +166,8 @@ adapter = NeuralTimeAdapter(
     # covariates_dim=cov_dim+2,
     covariates_dim=cov_dim,
     latent_dim=z_dim,
-    revin_patch_size_past=24,
-    revin_patch_size_future=24,
+    revin_patch_size_past=patch_size,
+    revin_patch_size_future=patch_size,
     hidden_dim=256,
     encoder_layers=2,
     decoder_layers=2,
@@ -206,7 +208,7 @@ model2.pretrain_stats_predictor(
     batch_size=64,
     lr=1e-4,
     weight_decay=1e-4,
-    patience=20,
+    patience=8,
     val_data=stats_val_data,
     verbose=True,
     use_swanlab=False,
@@ -215,6 +217,18 @@ model2.pretrain_stats_predictor(
 # for p in adapter.future_stats_predictor.parameters():
 #     p.requires_grad = False
 print(">>> Done pretraining stats predictor.")
+model2.pretrain_past_reconstruction_only(
+    past_target=y_p_tr,
+    past_covariates=x_p_tr,
+    n_epochs=30,
+    batch_size=32,
+    lr=1e-4,
+    weight_decay=1e-4,
+    debug=True,
+    debug_dir="./debug_no_revin_residual",
+    debug_plot=True,
+)
+print(">>> Done pretraining past_reconstruction.")
 model2.train_adapter(
     past_target=y_p_tr,
     past_covariates=x_p_tr,
@@ -227,8 +241,8 @@ model2.train_adapter(
     lambda_past_recon=0.4,
     lambda_future_pred=2.0,
     lambda_latent_stats=0,
-    lambda_stats_pred=0.4,
-    lambda_y_patch_std=0,
+    lambda_stats_pred=0.0,
+    lambda_y_patch_std=2.0,
     val_data=val_data,
     verbose=True,
     use_swanlab=False,

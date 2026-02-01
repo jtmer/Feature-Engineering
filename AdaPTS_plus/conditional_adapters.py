@@ -256,191 +256,21 @@ class PatchStatsPredictor(nn.Module):
 
         std_patch = torch.exp(logstd_clamped) + eps  # (B,1,Np), > 0
         return mu_patch, std_patch, logstd_clamped
-
-
-class ConditionalPatchVAEAdapter(nn.Module):
-    """
-    Adapter = encoder(y_past, x_past) -> z_past
-           + decoder(z, x_cov) -> y_hat (past recon OR future forecast)
-    - 支持 patch 粒度：先 patchify，再在 patch token 维度上建模。
-    - z 是“代理变量序列”，将喂给 foundation model（FM）。
-    """
-
-    def __init__(
-        self,
-        cov_dim: int,            # Cx
-        z_dim: int,              # Cz (代理通道数)
-        patch_size: int = 1,
-        hidden_dim: int = 256,
-        enc_layers: int = 2,
-        dec_layers: int = 2,
-        beta_kl: float = 1.0,
-        dropout: float = 0.0,
-    ):
+    
+class ResTemporalBlock(nn.Module):
+    def __init__(self, ch: int, k: int = 5, dropout: float = 0.0):
         super().__init__()
-        self.cov_dim = cov_dim
-        self.z_dim = z_dim
-        self.patch_size = patch_size
-        self.beta_kl = beta_kl
+        self.dw = nn.Conv1d(ch, ch, kernel_size=k, padding=k//2, groups=ch)
+        self.pw = nn.Conv1d(ch, ch, kernel_size=1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # encoder 输入： [y(1), x(Cx)] -> (1+Cx) channels
-        self.enc_in_dim = (1 + cov_dim) * patch_size if patch_size > 1 else (1 + cov_dim)
-        self.dec_cov_dim = cov_dim * patch_size if patch_size > 1 else cov_dim
-
-        # token-wise VAE: q(z|token) = N(mu, sigma)
-        self.encoder = MLP(self.enc_in_dim, hidden_dim, hidden_dim=hidden_dim, num_layers=enc_layers, dropout=dropout)
-        self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.logvar_head = nn.Linear(hidden_dim, z_dim)
-
-        # decoder: p(y|z, cov)
-        self.decoder = MLP(z_dim + self.dec_cov_dim, hidden_dim, hidden_dim=hidden_dim, num_layers=dec_layers, dropout=dropout)
-        self.y_head = nn.Linear(hidden_dim, patch_size)
-
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        eps = torch.randn_like(mu)
-        return mu + eps * torch.exp(0.5 * logvar)
-
-    def encode(self, y_past: torch.Tensor, x_past: torch.Tensor) -> AdapterOutput:
-        """
-        y_past: (B, 1, L)
-        x_past: (B, Cx, L)
-        return z: (B, Cz, Lz) where Lz = L//patch_size if patch_size>1 else L
-        """
-        assert y_past.dim() == 3 and x_past.dim() == 3
-        B, _, L = y_past.shape
-        assert x_past.shape[0] == B and x_past.shape[2] == L
-
-        if self.patch_size > 1:
-            y_tok = patchify(y_past, self.patch_size)        # (B, 1*P, Np)
-            x_tok = patchify(x_past, self.patch_size)        # (B, Cx*P, Np)
-            Np = y_tok.shape[-1]
-            inp = torch.cat([y_tok, x_tok], dim=1)           # (B, (1+Cx)*P, Np)
-        else:
-            Np = L
-            inp = torch.cat([y_past, x_past], dim=1)         # (B, 1+Cx, L)
-
-        # token-wise MLP: (B, Cin, Np) -> (B, Np, Cin) -> (B*Np, Cin)
-        inp2 = inp.permute(0, 2, 1).contiguous().view(B * Np, -1)
-        h = self.encoder(inp2)
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
-        z = self.reparameterize(mu, logvar)                  # (B*Np, Cz)
-
-        # KL per token
-        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        kl = self.beta_kl * kl
-
-        z = z.view(B, Np, self.z_dim).permute(0, 2, 1).contiguous()   # (B, Cz, Np)
-        return AdapterOutput(z=z, kl=kl)
-
-    def decode(self, z: torch.Tensor, x_cov: torch.Tensor) -> torch.Tensor:
-        """
-        z:     (B, Cz, Np)  (如果 patch_size==1，则 Np=L)
-        x_cov: (B, Cx, L)   (协变量在时间维仍是原始 L)
-        return y_hat: (B, 1, L)
-        """
-        B, Cz, Np = z.shape
-        assert Cz == self.z_dim
-
-        if self.patch_size > 1:
-            x_tok = patchify(x_cov, self.patch_size)         # (B, Cx*P, Np)
-            assert x_tok.shape[-1] == Np
-            cov2 = x_tok.permute(0, 2, 1).contiguous().view(B * Np, -1)  # (B*Np, Cx*P)
-        else:
-            # patch_size=1: x_cov token数 = L = Np
-            assert x_cov.shape[-1] == Np
-            cov2 = x_cov.permute(0, 2, 1).contiguous().view(B * Np, -1)  # (B*Np, Cx)
-
-        z2 = z.permute(0, 2, 1).contiguous().view(B * Np, Cz)            # (B*Np, Cz)
-        dec_in = torch.cat([z2, cov2], dim=-1)
-        h = self.decoder(dec_in)
-        y_hat = self.y_head(h).view(B, Np, self.patch_size).reshape(B, 1, Np * self.patch_size)  # (B,1,L)
-
-        # # token -> timestep
-        # y_hat = unpatchify(y_tok, self.patch_size)  # (B,1,L)
-        return y_hat
-
-class ConditionalPatchPCAAdapter(nn.Module):
-    """
-    非 VAE 版本：PCA encoder + 条件 decoder
-    encode(y_past,x_past) -> z_past（patch token 级）
-    decode(z, x_cov) -> y_hat（token -> timestep）
-    """
-    def __init__(self, cov_dim: int, z_dim: int, patch_size: int = 1,
-                 hidden_dim: int = 256, dec_layers: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.cov_dim = cov_dim
-        self.z_dim = z_dim
-        self.patch_size = patch_size
-
-        self.enc_in_dim = (1 + cov_dim) * patch_size if patch_size > 1 else (1 + cov_dim)
-        self.dec_cov_dim = cov_dim * patch_size if patch_size > 1 else cov_dim
-
-        self.pca = PCA(n_components=z_dim)
-        self._pca_fitted = False
-
-        self.decoder = MLP(z_dim + self.dec_cov_dim, hidden_dim, hidden_dim=hidden_dim, num_layers=dec_layers, dropout=dropout)
-        self.y_head = nn.Linear(hidden_dim, patch_size)
-
-    def fit_pca(self, y_past_np: np.ndarray, x_past_np: np.ndarray):
-        """
-        y_past_np: (N,1,L)
-        x_past_np: (N,Cx,L)
-        PCA 在 token 样本上 fit：样本数 = N * Np
-        """
-        y_t = torch.tensor(y_past_np, dtype=torch.float32)
-        x_t = torch.tensor(x_past_np, dtype=torch.float32)
-
-        if self.patch_size > 1:
-            y_tok = patchify(y_t, self.patch_size)  # (N, 1*P, Np)
-            x_tok = patchify(x_t, self.patch_size)  # (N, Cx*P, Np)
-            inp = torch.cat([y_tok, x_tok], dim=1)  # (N, (1+Cx)*P, Np)
-        else:
-            inp = torch.cat([y_t, x_t], dim=1)      # (N, 1+Cx, L)
-
-        N, Cin, Np = inp.shape
-        X = inp.permute(0,2,1).reshape(N*Np, Cin).numpy()  # (N*Np, Cin)
-
-        self.pca.fit(X)
-        self._pca_fitted = True
-
-    def encode(self, y_past: torch.Tensor, x_past: torch.Tensor) -> AdapterOutput:
-        assert self._pca_fitted, "Call fit_pca(...) before encode"
-        B, _, L = y_past.shape
-
-        if self.patch_size > 1:
-            y_tok = patchify(y_past, self.patch_size)
-            x_tok = patchify(x_past, self.patch_size)
-            inp = torch.cat([y_tok, x_tok], dim=1)   # (B, Cin, Np)
-        else:
-            inp = torch.cat([y_past, x_past], dim=1) # (B, Cin, L)
-
-        B, Cin, Np = inp.shape
-        X = inp.permute(0,2,1).reshape(B*Np, Cin).detach().cpu().numpy()
-        Z = self.pca.transform(X).astype(np.float32)        # (B*Np, z_dim)
-
-        z = torch.tensor(Z, device=y_past.device).view(B, Np, self.z_dim).permute(0,2,1).contiguous()
-        return AdapterOutput(z=z, kl=torch.tensor(0.0, device=y_past.device))
-
-    def decode(self, z: torch.Tensor, x_cov: torch.Tensor) -> torch.Tensor:
-        B, Cz, Np = z.shape
-        assert Cz == self.z_dim
-
-        if self.patch_size > 1:
-            x_tok = patchify(x_cov, self.patch_size)  # (B, Cx*P, Np)
-            cov2 = x_tok.permute(0,2,1).reshape(B*Np, -1)
-        else:
-            assert x_cov.shape[-1] == Np
-            cov2 = x_cov.permute(0,2,1).reshape(B*Np, -1)
-
-        z2 = z.permute(0,2,1).reshape(B*Np, Cz)
-        dec_in = torch.cat([z2, cov2], dim=-1)
-
-        h = self.decoder(dec_in)
-        y_hat = self.y_head(h).view(B, Np, self.patch_size).reshape(B, 1, Np * self.patch_size)  # (B,1,L)
-        # y_hat = unpatchify(y_tok, self.patch_size)  # (B,1,L)
-        return y_hat
+    def forward(self, x):
+        h = self.dw(x)
+        h = self.act(h)
+        h = self.pw(h)
+        h = self.drop(h)
+        return x + h
     
 class NeuralTimeAdapter(nn.Module):
     """
@@ -474,33 +304,40 @@ class NeuralTimeAdapter(nn.Module):
         encoder_input_channels = 1 + covariates_dim_aug
         decoder_input_channels = latent_dim + covariates_dim_aug
 
-        def build_pointwise_mlp(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
+        def build_temporal_decoder(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
             layers = []
-            channels = input_channels
-            for _ in range(max(1, num_layers - 1)):
-                layers.append(nn.Conv1d(channels, hidden_dim, kernel_size=1))
+            ch = input_channels
+            for i in range(max(1, num_layers - 1)):
+                layers.append(nn.Conv1d(ch, hidden_dim, kernel_size=1))
                 layers.append(nn.GELU())
+
+                # 时域混合（depthwise）+ 残差
+                layers.append(nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim))
+                layers.append(nn.GELU())
+
                 if dropout > 0:
                     layers.append(nn.Dropout(dropout))
-                channels = hidden_dim
-            layers.append(nn.Conv1d(channels, output_channels, kernel_size=1))
+                ch = hidden_dim
+
+            layers.append(nn.Conv1d(ch, output_channels, kernel_size=1))
             return nn.Sequential(*layers)
 
         # (B, 1+Cx, L) -> (B, z_dim, L)
-        self.latent_encoder = build_pointwise_mlp(
+        self.latent_encoder = build_temporal_decoder(
             input_channels=encoder_input_channels,
             output_channels=latent_dim,
             num_layers=encoder_layers,
         )
 
         # (B, z_dim+Cx, L) -> (B, 1, L)
-        self.target_decoder = build_pointwise_mlp(
+        self.target_decoder = build_temporal_decoder(
             input_channels=decoder_input_channels,
             output_channels=1,
             num_layers=decoder_layers,
         )
 
-        self.normalize_latents = normalize_latents
+        # self.normalize_latents = normalize_latents
+        self.normalize_latents = False
         self.latent_normalizer = (
             nn.GroupNorm(num_groups=1, num_channels=latent_dim) if normalize_latents else nn.Identity()
         )
@@ -531,6 +368,7 @@ class NeuralTimeAdapter(nn.Module):
         latent_series = self.latent_normalizer(latent_series)
         return latent_series
 
+    # def decode(self, latent_series: torch.Tensor, covariates_series: torch.Tensor, logstd_t: torch.Tensor):
     def decode(self, latent_series: torch.Tensor, covariates_series: torch.Tensor):
         """
         latent_series:     (B,Cz,L)
@@ -545,6 +383,15 @@ class NeuralTimeAdapter(nn.Module):
         decoder_inputs = torch.cat([latent_series, covariates_series], dim=1)  # (B,Cz+Cx,L)
         target_hat = self.target_decoder(decoder_inputs)                       # (B,1,L)
         return target_hat
+        # out = self.target_decoder(decoder_inputs)   # (B,2,T)
+        # base = out[:, 0:1, :]
+        # res  = torch.tanh(out[:, 1:2, :])           # [-1,1] 限幅
+        # # return base, res
+        
+        # logstd_ref = logstd_t.detach()
+        # amp = 0.2 + 0.8 * torch.sigmoid(logstd_ref) # (B,1,H)，范围 [0.2,1.0]
+        # target_pred_norm = base + amp * res
+        # return target_pred_norm
     
     def predict_future_stats(self, future_covariates: torch.Tensor):
         """
