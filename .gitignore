@@ -12,3 +12,9 @@ gnn_moe_transformer_torch.py
 *.csv
 
 *.log
+
+debug_no_revin_residual/
+debug_train_adapter/
+results_monthly_backtest/
+swanlog/
+vis_conditional_adapts/
