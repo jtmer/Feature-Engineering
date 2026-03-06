@@ -67,30 +67,21 @@ class ConsoleLogger(Callback):
         metrics = state["metrics"]
         alpha_stats = state.get("alpha_stats", None)
 
-        if mode == "train":
-            msg = (
-                f"[adapter-train] epoch={epoch:03d} "
-                f"alpha_stats={alpha_stats:.3f} "
-                f"loss={metrics.get('loss', 0.0):.6f} "
-                f"past_recon={metrics.get('past_recon', 0.0):.4f} "
-                f"future_pred={metrics.get('future_pred', 0.0):.4f} "
-                f"latent_stats={metrics.get('latent_stats', 0.0):.4f} "
-                f"stats_pred={metrics.get('stats_pred', 0.0):.4f} "
-                f"y_patch_moment={metrics.get('y_patch_moment', 0.0):.4f}"
-            )
-            logger.info(msg)
-
-        elif mode == "val":
-            msg = (
-                f"[adapter-val  ] epoch={epoch:03d} "
-                f"loss={metrics.get('loss', 0.0):.6f} "
-                f"past_recon={metrics.get('past_recon', 0.0):.4f} "
-                f"future_pred={metrics.get('future_pred', 0.0):.4f} "
-                f"latent_stats={metrics.get('latent_stats', 0.0):.4f} "
-                f"stats_pred={metrics.get('stats_pred', 0.0):.4f} "
-                f"y_patch_moment={metrics.get('y_patch_moment', 0.0):.4f}"
-            )
-            logger.info(msg)
+        msg = (
+            f"[adapter-{mode:5s}] epoch={epoch:03d} "
+            f"loss={metrics.get('loss',0):.6f} "
+            f"past_recon={metrics.get('past_recon',0):.4f} "
+            f"future_pred={metrics.get('future_pred',0):.4f} "
+            f"stats_pred={metrics.get('stats_pred',0):.4f} "
+            f"resid_l2={metrics.get('resid_l2',0):.4f} | "
+            f"resid_std_ratio={metrics.get('resid_std_ratio',0):.3f} "
+            f"proxy_std_ratio={metrics.get('proxy_std_ratio',0):.3f} "
+            f"corr(p,y)={metrics.get('corr_proxy_y',0):.3f} "
+            f"proxy_ac1={metrics.get('proxy_ac1',0):.3f}"
+        )
+        if mode == 'train' and alpha_stats is not None:
+            msg += f" alpha_stats={alpha_stats:.3f}"
+        logger.info(msg)
 
 class PlotDumper(Callback):
     """
@@ -220,8 +211,10 @@ class PlotDumper(Callback):
         P_fut = dbg["P_fut"]
         alpha_stats = dbg["alpha_stats"]
 
-        past_latents = dbg["past_latents"]
-        future_latents_pred = dbg["future_latents_pred"]
+        # past_latents = dbg["past_latents"]
+        past_proxy = dbg["past_proxy"]
+        # future_latents_pred = dbg["future_latents_pred"]
+        future_proxy_pred = dbg["future_proxy_pred"]
 
         past_target_norm = dbg["past_target_norm"]
         past_recon_norm = dbg["past_target_recon_norm"]
@@ -243,14 +236,17 @@ class PlotDumper(Callback):
 
         B0 = past_target_norm.size(0)
         nseq = min(self.num_seq, B0)
-        nch = min(self.latent_ch, past_latents.size(1))
+        # nch = min(self.latent_ch, past_latents.size(1))
+        nch = min(self.latent_ch, past_proxy.size(1))
 
         logger.info("\n================ DEBUG DUMP ================")
         logger.info(f"[dbg] epoch={epoch} alpha_stats={alpha_stats:.3f} B={B0} "
               f"P_past={P_past} P_fut={P_fut}")
 
-        self._print_tensor_stats("past_latents(trend)", past_latents)
-        self._print_tensor_stats("future_latents_pred", future_latents_pred)
+        # self._print_tensor_stats("past_latents(trend)", past_latents)
+        self._print_tensor_stats("past_proxy", past_proxy)
+        # self._print_tensor_stats("future_latents_pred", future_latents_pred)
+        self._print_tensor_stats("future_proxy_pred", future_proxy_pred)
 
         self._print_tensor_stats("past_target_norm", past_target_norm)
         self._print_tensor_stats("past_recon_norm(y)", past_recon_norm)
@@ -304,8 +300,10 @@ class PlotDumper(Callback):
 
         for i in range(nseq):
             for c in range(nch):
-                z_tr = self._to_np(past_latents[i, c])
-                z_tr_f = self._to_np(future_latents_pred[i, c])
+                # z_tr = self._to_np(past_latents[i, c])
+                # z_tr_f = self._to_np(future_latents_pred[i, c])
+                z_tr = self._to_np(past_proxy[i, c])
+                z_tr_f = self._to_np(future_proxy_pred[i, c])
                 self._plot_series(
                     save_path=os.path.join(out_dir, f"trend_ch{c}_b{i}.png"),
                     series_dict={"past_trend": z_tr, "future_trend_pred": z_tr_f},
@@ -399,10 +397,6 @@ class EarlyStopper(Callback):
 
 
 class ConditionalAdaPTS:
-    """
-    adapter: PipelineAdapter
-        encoder / decoder / normalizer / stats_predictor(optional)
-    """
     def __init__(
         self,
         adapter: nn.Module,
@@ -414,28 +408,28 @@ class ConditionalAdaPTS:
         self.device = torch.device(device)
         self.adapter.to(self.device)
     
-    # def _identity_norm(self, y: torch.Tensor):
-    #     # y: (B,1,T)
-    #     mu = torch.zeros_like(y)
-    #     std = torch.ones_like(y)
-    #     return y, mu, std
+    def _identity_norm(self, y: torch.Tensor):
+        # y: (B,1,T)
+        mu = torch.zeros_like(y)
+        std = torch.ones_like(y)
+        return y, mu, std
 
-    # def _identity_stats(self, y: torch.Tensor):
-    #     mu = torch.zeros_like(y)
-    #     std = torch.ones_like(y)
-    #     return mu, std
+    def _identity_stats(self, y: torch.Tensor):
+        mu = torch.zeros_like(y)
+        std = torch.ones_like(y)
+        return mu, std
 
-    # def _identity_denorm(self, y_norm: torch.Tensor, mu: torch.Tensor, std: torch.Tensor):
-    #     return y_norm
+    def _identity_denorm(self, y_norm: torch.Tensor, mu: torch.Tensor, std: torch.Tensor):
+        return y_norm
     
-    # def _patch_stats_1d(self, x: torch.Tensor, patch: int):
-    #     B, C, T = x.shape
-    #     assert T % patch == 0
-    #     Np = T // patch
-    #     x4 = x.view(B, C, Np, patch)
-    #     mean = x4.mean(dim=-1)
-    #     std = x4.std(dim=-1) + 1e-5
-    #     return mean, std
+    def _patch_stats_1d(self, x: torch.Tensor, patch: int):
+        B, C, T = x.shape
+        assert T % patch == 0
+        Np = T // patch
+        x4 = x.view(B, C, Np, patch)
+        mean = x4.mean(dim=-1)
+        std = x4.std(dim=-1) + 1e-5
+        return mean, std
 
     def _latent_stats_loss(self, past_latents: torch.Tensor, future_latents: torch.Tensor) -> torch.Tensor:
         past_mu = past_latents.mean(dim=-1)
@@ -444,41 +438,41 @@ class ConditionalAdaPTS:
         future_std = future_latents.std(dim=-1)
         return F.mse_loss(past_mu, future_mu) + F.mse_loss(past_std, future_std)
 
-    # def _compute_alpha_stats(self, epoch: int, n_epochs: int) -> float:
-    #     progress = epoch / max(1, n_epochs - 1)
-    #     return float(np.clip((progress - 0.1) / 0.4, 0.0, 1.0))
+    def _compute_alpha_stats(self, epoch: int, n_epochs: int) -> float:
+        progress = epoch / max(1, n_epochs - 1)
+        return float(np.clip((progress - 0.1) / 0.4, 0.0, 1.0))
 
-    # def _norm_past(self, y_past: torch.Tensor, patch_size: int, use_patch_revin: bool):
-    #     if use_patch_revin:
-    #         y_norm, mu_t, std_t, _, _ = revin_patch_norm_target(y_past, patch_size=patch_size)
-    #     else:
-    #         y_norm, mu_t, std_t = self._identity_norm(y_past)
-    #     return y_norm, mu_t, std_t
+    def _norm_past(self, y_past: torch.Tensor, patch_size: int, use_patch_revin: bool):
+        if use_patch_revin:
+            y_norm, mu_t, std_t, _, _ = revin_patch_norm_target(y_past, patch_size=patch_size)
+        else:
+            y_norm, mu_t, std_t = self._identity_norm(y_past)
+        return y_norm, mu_t, std_t
 
-    # def _future_true_stats(self, y_future: torch.Tensor, patch_size: int, use_patch_revin: bool):
-    #     if use_patch_revin:
-    #         mu_t_true, std_t_true, mu_p_true, std_p_true = revin_patch_stats_target(y_future, patch_size=patch_size)
-    #     else:
-    #         mu_t_true, std_t_true = self._identity_stats(y_future)
-    #         mu_p_true, std_p_true = self._patch_stats_1d(y_future, patch_size)
-    #     return mu_t_true, std_t_true, mu_p_true, std_p_true
+    def _future_true_stats(self, y_future: torch.Tensor, patch_size: int, use_patch_revin: bool):
+        if use_patch_revin:
+            mu_t_true, std_t_true, mu_p_true, std_p_true = revin_patch_stats_target(y_future, patch_size=patch_size)
+        else:
+            mu_t_true, std_t_true = self._identity_stats(y_future)
+            mu_p_true, std_p_true = self._patch_stats_1d(y_future, patch_size)
+        return mu_t_true, std_t_true, mu_p_true, std_p_true
 
-    # def _mix_future_time_stats(
-    #     self,
-    #     mu_t_true: torch.Tensor,
-    #     std_t_true: torch.Tensor,
-    #     mu_t_hat: torch.Tensor,
-    #     std_t_hat: torch.Tensor,
-    #     alpha_stats: float,
-    #     std_floor: float = 0.05,
-    # ):
-    #     mu_mix = (1.0 - alpha_stats) * mu_t_true + alpha_stats * mu_t_hat
-    #     logstd_true = torch.log(std_t_true + 1e-5)
-    #     logstd_hat = torch.log(std_t_hat + 1e-5)
-    #     logstd_mix = (1.0 - alpha_stats) * logstd_true + alpha_stats * logstd_hat
-    #     std_mix = torch.exp(logstd_mix)
-    #     std_mix = torch.clamp(std_mix, min=std_floor)
-    #     return mu_mix, std_mix
+    def _mix_future_time_stats(
+        self,
+        mu_t_true: torch.Tensor,
+        std_t_true: torch.Tensor,
+        mu_t_hat: torch.Tensor,
+        std_t_hat: torch.Tensor,
+        alpha_stats: float,
+        std_floor: float = 0.05,
+    ):
+        mu_mix = (1.0 - alpha_stats) * mu_t_true + alpha_stats * mu_t_hat
+        logstd_true = torch.log(std_t_true + 1e-5)
+        logstd_hat = torch.log(std_t_hat + 1e-5)
+        logstd_mix = (1.0 - alpha_stats) * logstd_true + alpha_stats * logstd_hat
+        std_mix = torch.exp(logstd_mix)
+        std_mix = torch.clamp(std_mix, min=std_floor)
+        return mu_mix, std_mix
 
     # ---------- LTM prediction ----------
     def _predict_future_latents_with_ltm(
@@ -551,101 +545,67 @@ class ConditionalAdaPTS:
         P_fut = self.adapter.revin_patch_size_future
 
         # -------- stats & norms --------
-        y_past_norm, past_mu_t, past_std_t = self.adapter.normalizer.norm_past(y_past, patch_size=P_past)
-
-        future_mu_t_true, future_std_t_true, future_mu_p_true, future_std_p_true = \
-            self.adapter.normalizer.future_true_stats(y_future, patch_size=P_fut)
+        y_past_norm, past_mu_t, past_std_t = self._norm_past(y_past, P_past, use_patch_revin)
+        future_mu_t_true, future_std_t_true, future_mu_p_true, future_std_p_true = self._future_true_stats(y_future, P_fut, use_patch_revin)
 
         # adapter: predict stats from future covariates
-        future_mu_t_hat, future_std_t_hat, future_mu_p_hat, future_std_p_hat, future_logstd_p_hat = \
-            self.adapter.predict_future_stats(x_future)
+        future_mu_t_hat, future_std_t_hat, future_mu_p_hat, future_std_p_hat, future_logstd_p_hat = self.adapter.predict_future_stats(x_future)
 
         # mix time-level stats
-        # mu_hat_for_mix = future_mu_t_hat.detach()
-        # mu_ref, std_ref = self._mix_future_time_stats(future_mu_t_true, future_std_t_true, mu_hat_for_mix, future_std_t_hat, alpha_stats)
-        mu_ref, std_ref = self.adapter.normalizer.mix_future_time_stats(
-            mu_t_true=future_mu_t_true,
-            std_t_true=future_std_t_true,
-            mu_t_hat=future_mu_t_hat,
-            std_t_hat=future_std_t_hat,
-            alpha_stats=alpha_stats,
-        )
+        mu_hat_for_mix = future_mu_t_hat.detach()
+        mu_ref, std_ref = self._mix_future_time_stats(future_mu_t_true, future_std_t_true, mu_hat_for_mix, future_std_t_hat, alpha_stats)
 
         # -------- encode / decode --------
-        past_latents = self.adapter.encode(y_past_norm, x_past)
-        if past_latents.size(1) != 1:
-            raise ValueError(f"[{mode}] latent_dim must be 1 for proxy/residual setting, got {past_latents.size(1)}")
+        # past_latents = self.adapter.encode(y_past_norm, x_past)
+        past_resid = self.adapter.encode(y_past_norm, x_past)          # (B,1,L)
+        past_proxy = y_past_norm - past_resid
 
-        y_future_norm_true = self.adapter.normalizer.norm_future_with_true_stats(
-            y_future, mu_t_true=future_mu_t_true, std_t_true=future_std_t_true
-        )
+        y_future_norm_true = (y_future - future_mu_t_true) / (future_std_t_true + 1e-5)
         future_latents_true = self.adapter.encode(y_future_norm_true, x_future)
         if future_latents_true.size(1) != 1:
             raise ValueError(f"[{mode}] latent_dim must be 1, got {future_latents_true.size(1)}")
 
-        #* past recon loss
-        past_target_recon_norm = self.adapter.decode(past_latents, x_past)
-        loss_past_recon = F.mse_loss(past_target_recon_norm, y_past_norm)
-        # if use_patch_revin:
-        #     past_target_recon = revin_patch_denorm_target(past_target_recon_norm, past_mu_t, past_std_t)
-        #     loss_past_recon = F.mse_loss(past_target_recon, y_past)
-        # else:
-        #     loss_past_recon = F.mse_loss(past_target_recon_norm, y_past_norm)
+        # past recon
+        past_target_recon_norm = self.adapter.decode(past_proxy, x_past)
+        if use_patch_revin:
+            past_target_recon = revin_patch_denorm_target(past_target_recon_norm, past_mu_t, past_std_t)
+            loss_past_recon = F.mse_loss(past_target_recon, y_past)
+        else:
+            loss_past_recon = F.mse_loss(past_target_recon_norm, y_past_norm)
             
 
         # future pred via LTM + decoder
-        future_latents_pred = self._predict_future_latents_with_ltm(
-            past_latents=past_latents,
+        future_proxy_pred = self._predict_future_latents_with_ltm(
+            past_latents=past_proxy,
             future_horizon=y_future.shape[-1],
             ltm_batch_size=ltm_batch_size,
         )
         
-        future_target_pred_norm = self.adapter.decode(future_latents_pred, x_future)
-        future_target_pred = self.adapter.normalizer.denorm_future_pred(
-            y_future_pred_norm=future_target_pred_norm,
-            mu_ref=mu_ref.detach(),
-            std_ref=std_ref.detach(),
-        )
-        
-        # if use_patch_revin:
-        #     # denorm with mixed stats
-        #     future_target_pred = revin_patch_denorm_target(future_target_pred_norm, mu_ref.detach(), std_ref.detach())
-        #     loss_future_pred = F.mse_loss(future_target_pred, y_future)
-        #     target_norm_ref = (y_future - mu_ref) / std_ref
-        # else:
-        #     # no revin
-        #     future_target_pred = future_target_pred_norm
-        #     loss_future_pred = F.mse_loss(future_target_pred_norm, y_future)
-        #     target_norm_ref = y_future
-        #     mu_ref = torch.zeros_like(y_future)
-        #     std_ref = torch.ones_like(y_future)
-        target_norm_ref = self.adapter.normalizer.target_norm_ref(
-            y_future=y_future,
-            mu_ref=mu_ref.detach(),
-            std_ref=std_ref.detach(),
-        )
-        
-        #* future pred loss
-        loss_future_pred = self.adapter.normalizer.future_pred_loss(
-            y_pred=future_target_pred,
-            y_true=y_future,
-            y_pred_norm=future_target_pred_norm,
-            y_true_norm=y_future,  # identity uses this; revin_patch ignores
-        )
+        future_target_pred_norm = self.adapter.decode(future_proxy_pred, x_future)
+        if use_patch_revin:
+            # denorm with mixed stats
+            future_target_pred = revin_patch_denorm_target(future_target_pred_norm, mu_ref.detach(), std_ref.detach())
+            loss_future_pred = F.mse_loss(future_target_pred, y_future)
+            target_norm_ref = (y_future - mu_ref) / std_ref
+        else:
+            # no revin
+            future_target_pred = future_target_pred_norm
+            loss_future_pred = F.mse_loss(future_target_pred_norm, y_future)
+            target_norm_ref = y_future
+            mu_ref = torch.zeros_like(y_future)
+            std_ref = torch.ones_like(y_future)
 
-        #* stats predictor loss
-        loss_stats_pred = torch.tensor(0.0, device=self.device)
-        if loss_weights.get("stats_pred", 0.0) > 0.0 and self.adapter.has_stats_predictor:
-            # define "true logstd patch" from true patch std
-            future_logstd_p_true = torch.log(future_std_p_true + 1e-5)
-            loss_stats_pred = F.mse_loss(future_mu_p_hat, future_mu_p_true) + 5.0 * F.mse_loss(future_logstd_p_hat, future_logstd_p_true)
+        # -------- stats predictor loss (patch-level) --------
+        future_logstd_p_true = torch.log(future_std_p_true + 1e-5)
+        loss_stats_pred = F.mse_loss(future_mu_p_hat, future_mu_p_true) + 5.0 * F.mse_loss(future_logstd_p_hat, future_logstd_p_true)
 
-        #* latent stats alignment loss
-        loss_latent_stats = torch.tensor(0.0, device=self.device)
-        if loss_weights.get("latent_stats", 0.0) > 0.0:
-            loss_latent_stats = self._latent_stats_loss(past_latents.detach(), future_latents_true)
+        # residual 不要太大（否则 proxy 太小 LTM 没意义）
+        loss_resid_l2 = (past_resid ** 2).mean()
 
-        #* y patch moment loss
+        # # -------- latent stats alignment --------
+        # loss_latent_stats = self._latent_stats_loss(past_latents.detach(), future_latents_true)
+
+        # -------- y patch moment loss --------
         loss_y_patch_moment = torch.tensor(0.0, device=self.device)
         if loss_weights.get("y_patch_moment", 0.0) > 0.0:
             P = P_fut
@@ -660,13 +620,39 @@ class ConditionalAdaPTS:
             ms_true = (true4_norm ** 2).mean(dim=-1)
             loss_y_patch_moment = F.mse_loss(ms_pred, ms_true) + 0.5 * F.mse_loss(m_pred, m_true)
 
+        # -------- monitoring stats (no grad) --------
+        with torch.no_grad():
+            eps = 1e-6
+            y_std = y_past_norm.std().clamp_min(eps)
+            resid_std = past_resid.std()
+            proxy_std = past_proxy.std()
 
+            resid_std_ratio = (resid_std / y_std)
+            proxy_std_ratio = (proxy_std / y_std)
+
+            # corr(proxy, y) in flattened space
+            y0 = y_past_norm.reshape(-1)
+            p0 = past_proxy.reshape(-1)
+            y0 = y0 - y0.mean()
+            p0 = p0 - p0.mean()
+            corr_proxy_y = (y0 * p0).mean() / (y0.std().clamp_min(eps) * p0.std().clamp_min(eps))
+
+            # lag-1 autocorr of proxy
+            p = past_proxy[..., :-1].reshape(-1)
+            q = past_proxy[..., 1:].reshape(-1)
+            p = p - p.mean()
+            q = q - q.mean()
+            proxy_ac1 = (p * q).mean() / (p.std().clamp_min(eps) * q.std().clamp_min(eps))
+
+
+        # -------- total --------
         total_loss = (
             loss_weights.get("past_recon", 1.0) * loss_past_recon
             + loss_weights.get("future_pred", 1.0) * loss_future_pred
-            + loss_weights.get("latent_stats", 0.1) * loss_latent_stats
+            # + loss_weights.get("latent_stats", 0.1) * loss_latent_stats
             + loss_weights.get("stats_pred", 0.1) * loss_stats_pred
             + loss_weights.get("y_patch_moment", 0.0) * loss_y_patch_moment
+            + loss_weights.get("resid_l2", 0.1) * loss_resid_l2
         )
 
         out: Dict[str, Any] = {
@@ -674,39 +660,57 @@ class ConditionalAdaPTS:
                 "loss": total_loss,
                 "past_recon": loss_past_recon,
                 "future_pred": loss_future_pred,
-                "latent_stats": loss_latent_stats,
+                # "latent_stats": loss_latent_stats,
                 "stats_pred": loss_stats_pred,
                 "y_patch_moment": loss_y_patch_moment,
+                "resid_l2": loss_resid_l2,
             }
         }
+        out["losses"].update({
+            "resid_std_ratio": resid_std_ratio,
+            "proxy_std_ratio": proxy_std_ratio,
+            "corr_proxy_y": corr_proxy_y,
+            "proxy_ac1": proxy_ac1,
+        })
 
         if debug_collect:
+            # 用于 PlotDumper
             out["debug"] = {
                 "alpha_stats": alpha_stats,
                 "P_past": P_past,
                 "P_fut": P_fut,
-                "past_latents": past_latents.detach(),
-                "future_latents_pred": future_latents_pred.detach(),
+
+                "past_proxy": past_proxy.detach(),
+                "future_proxy_pred": future_proxy_pred.detach(),
+                "future_latents_true": future_latents_true.detach(),
+
                 "past_target_norm": y_past_norm.detach(),
                 "past_target_recon_norm": past_target_recon_norm.detach(),
+
                 "future_target_pred_norm": future_target_pred_norm.detach(),
                 "target_norm_ref": target_norm_ref.detach(),
+
                 "future_target_pred": future_target_pred.detach(),
                 "future_target_true": y_future.detach(),
+
                 "mu_ref": mu_ref.detach(),
                 "std_ref": std_ref.detach(),
+
+                "future_covariates_aug_true": x_future.detach(),
+                "adapter_decode": self.adapter.decode,            # probe 用
             }
 
         return out
-
+    
     def _run_epoch(
         self,
         dataloader: DataLoader,
         *,
         epoch: int,
         n_epochs: int,
-        mode: str,  # train or eval
+        mode: str,  # "train" or "val"
         optimizer: Optional[torch.optim.Optimizer],
+        use_patch_revin: bool,
         ltm_batch_size: int,
         loss_weights: Dict[str, float],
         callbacks: Optional[List[Callback]] = None,
@@ -721,7 +725,10 @@ class ConditionalAdaPTS:
         self.iclearner.eval()
         alpha_stats = self._compute_alpha_stats(epoch, n_epochs)
 
-        meter = EpochMeters.new(keys=["loss", "past_recon", "future_pred", "latent_stats", "stats_pred", "y_patch_moment"])
+        meter = EpochMeters.new(keys=["loss", "past_recon", "future_pred", "latent_stats", "stats_pred", "y_patch_moment", "resid_l2",
+            "resid_std_ratio", "proxy_std_ratio", "corr_proxy_y", "proxy_ac1",])
+
+        # debug 只在 train 且 epoch%debug_every==0 时收集一次
         want_debug = (mode == "train") and (epoch % debug_every == 0)
 
         for (y_p, x_p, y_f, x_f) in dataloader:
@@ -730,7 +737,7 @@ class ConditionalAdaPTS:
             y_f = y_f.to(self.device)
             x_f = x_f.to(self.device)
 
-            debug_collect = want_debug
+            debug_collect = want_debug  # 由 PlotDumper 控制只缓存一个 batch；这里每 batch 都给 state，但回调会只取第一次
 
             with torch.set_grad_enabled(is_train):
                 out = self._forward_once(
@@ -739,6 +746,7 @@ class ConditionalAdaPTS:
                     y_future=y_f,
                     x_future=x_f,
                     alpha_stats=alpha_stats,
+                    use_patch_revin=use_patch_revin,
                     ltm_batch_size=ltm_batch_size,
                     loss_weights=loss_weights,
                     mode=mode,
@@ -748,10 +756,21 @@ class ConditionalAdaPTS:
                 if is_train:
                     optimizer.zero_grad()
                     out["losses"]["loss"].backward()
-                    optimizer.step()
 
                     if want_debug:
+                        gnorm = 0.0
+                        for n, p in self.adapter.named_parameters():
+                            if p.grad is None:
+                                continue
+                            if "target_decoder" in n:
+                                gnorm += p.grad.detach().data.norm(2).item() ** 2
+                        gnorm = gnorm ** 0.5
+                        logger.info(f"[dbg] grad_norm(target_decoder)={gnorm:.4g}")
+
+                        # 防止一个 epoch 多次打印：打印一次后关闭 want_debug 的打印部分
                         want_debug = False
+
+                    optimizer.step()
 
             bsz = y_p.size(0)
             meter.update(out["losses"], bsz)
@@ -797,9 +816,11 @@ class ConditionalAdaPTS:
         lambda_latent_stats: float = 0.1,
         lambda_stats_pred: float = 0.1,
         lambda_y_patch_std: float = 0.2,
+        lambda_resid_l2: float = 0.1,
         ltm_batch_size: int = 1,
         verbose: bool = True,
         val_data: Optional[Dict[str, np.ndarray]] = None,
+        use_patch_revin: bool = False,
         use_swanlab: bool = True,
         swanlab_run=None,
         debug: bool = True,
@@ -809,10 +830,6 @@ class ConditionalAdaPTS:
         debug_latent_ch: int = 1,
         earlystop_patience: int = 10,
     ):
-        if not getattr(self.adapter, "is_trainable", True):
-            logger.info("[train_adapter] adapter is not trainable -> skip.")
-            return
-        
         dataset = TensorDataset(
             torch.tensor(past_target, dtype=torch.float32),
             torch.tensor(past_covariates, dtype=torch.float32),
@@ -843,6 +860,7 @@ class ConditionalAdaPTS:
             "latent_stats": lambda_latent_stats,
             "stats_pred": lambda_stats_pred,
             "y_patch_moment": lambda_y_patch_std,
+            "resid_l2": lambda_resid_l2,
         }
 
         callbacks: List[Callback] = []
@@ -864,23 +882,27 @@ class ConditionalAdaPTS:
         callbacks.append(earlystop)
 
         for epoch in range(n_epochs):
+            # train
             train_metrics = self._run_epoch(
                 dataloader=train_loader,
                 epoch=epoch,
                 n_epochs=n_epochs,
                 mode="train",
                 optimizer=optimizer,
+                use_patch_revin=use_patch_revin,
                 ltm_batch_size=ltm_batch_size,
                 loss_weights=loss_weights,
                 callbacks=callbacks,
                 debug_every=debug_every,
             )
 
+            # swanlab
             if use_swanlab and (swanlab_run is not None):
                 log_dict = {f"train/{k}": v for k, v in train_metrics.items()}
                 log_dict["epoch"] = epoch
                 swanlab_run.log(log_dict)
 
+            # val
             if val_loader is not None:
                 val_metrics = self._run_epoch(
                     dataloader=val_loader,
@@ -888,6 +910,7 @@ class ConditionalAdaPTS:
                     n_epochs=n_epochs,
                     mode="val",
                     optimizer=None,
+                    use_patch_revin=use_patch_revin,
                     ltm_batch_size=ltm_batch_size,
                     loss_weights=loss_weights,
                     callbacks=callbacks,
@@ -900,6 +923,7 @@ class ConditionalAdaPTS:
                     swanlab_run.log(log_dict)
 
             else:
+                # 无 val：用 train loss 做 early stop
                 fake_val_state = {
                     "mode": "val",
                     "epoch": epoch,
@@ -911,17 +935,21 @@ class ConditionalAdaPTS:
             if earlystop.should_stop:
                 break
 
+        # restore best
         if earlystop.best_state_dict is not None:
             self.adapter.load_state_dict(earlystop.best_state_dict)
             if verbose:
                 logger.info(f"[earlystop] restored best adapter weights from epoch={earlystop.best_epoch} "
-                            f"(best_loss={earlystop.best_value:.6f})")
+                      f"(best_loss={earlystop.best_value:.6f})")
+        else:
+            if verbose:
+                logger.info("[earlystop] WARNING: no best_state_dict saved (maybe no epochs ran?)")
     
     
     def pretrain_stats_predictor(
         self,
-        future_target: np.ndarray,
-        future_covariates: np.ndarray,
+        future_target: np.ndarray,      # (N,1,H)
+        future_covariates: np.ndarray,  # (N,Cx,H)
         n_epochs: int = 20,
         batch_size: int = 64,
         lr: float = 1e-3,
@@ -930,19 +958,21 @@ class ConditionalAdaPTS:
         patience: int = 10,
         verbose: bool = True,
         use_swanlab: bool = False,
-        swanlab_run=None,
+        swanlab_run = None,
     ):
         """
         只训练 adapter.future_stats_predictor:
           x_future -> (mu_patch_hat, std_patch_hat)
         目标: 贴近 revin_patch_stats_target 得到的真实 patch 均值/方差
         """
-        if not getattr(self.adapter, "has_stats_predictor", False):
-            logger.info("[pretrain_stats_predictor] no stats_predictor -> skip.")
-            return
-        
         self.adapter.train()
-        optimizer = torch.optim.Adam(self.adapter.future_stats_predictor.parameters(), lr=lr, weight_decay=weight_decay)
+        
+        # 只优化 stats predictor 的参数
+        optimizer = torch.optim.Adam(
+            self.adapter.future_stats_predictor.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
         
         P_fut = self.adapter.revin_patch_size_future
         
@@ -951,11 +981,12 @@ class ConditionalAdaPTS:
             torch.tensor(future_covariates, dtype=torch.float32),
         )
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        
         if val_data is not None:
+            val_future_target = val_data["future_target"]
+            val_future_covariates = val_data["future_covariates"]
             val_dataset = TensorDataset(
-                torch.tensor(val_data["future_target"], dtype=torch.float32),
-                torch.tensor(val_data["future_covariates"], dtype=torch.float32),
+                torch.tensor(val_future_target, dtype=torch.float32),
+                torch.tensor(val_future_covariates, dtype=torch.float32),
             )
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         else:
@@ -983,18 +1014,24 @@ class ConditionalAdaPTS:
                 batch_future_cov    = batch_future_cov.to(self.device)      # (B,Cx,H)
                 
                 # 真实 patch 统计
-                _, _, mu_p_true, std_p_true = self.adapter.normalizer.future_true_stats(
+                _, _, mu_p_true, std_p_true = revin_patch_stats_target(
                     batch_future_target, patch_size=P_fut
-                )
-                logstd_true = torch.log(std_p_true + 1e-5)
+                )  # mu/std_p_true: (B,1,Np)
+                logstd_p_true = torch.log(std_p_true + 1e-5)
                 
                 # 预测 patch 统计
-                mu_p_hat, std_p_hat, logstd_hat = self.adapter.future_stats_predictor(batch_future_cov)
+                mu_p_hat, std_p_hat, logstd_p_hat = self.adapter.future_stats_predictor(batch_future_cov)
                 
                 # 和 train_adapter 中保持一致的损失形式
-                loss_mu = F.mse_loss(mu_p_hat, mu_p_true)
+                logstd_hat = torch.log(std_p_hat + 1e-5)
+                logstd_true = torch.log(std_p_true + 1e-5)
+                loss_mu    = F.mse_loss(mu_p_hat, mu_p_true)
+                # loss_std   = F.mse_loss(std_p_hat, std_p_true)
                 loss_std = F.mse_loss(logstd_hat, logstd_true)
-                loss = loss_mu + 2.0 * loss_std
+                
+                # logger.info('std:true vs pred', logstd_true, logstd_hat)
+                
+                loss = loss_mu + 2*loss_std
                 
                 if is_train:
                     optimizer.zero_grad()
@@ -1058,16 +1095,21 @@ class ConditionalAdaPTS:
         if best_state_dict is not None:
             self.adapter.future_stats_predictor.load_state_dict(best_state_dict)
             if verbose:
-                logger.info(f"[stats-pretrain] restored best future_stats_predictor from epoch={best_epoch} (val_loss={best_val_loss:.6f})")
+                logger.info(f"[stats-pretrain] restored best future_stats_predictor "
+                      f"from epoch={best_epoch} (val_loss={best_val_loss:.6f})")
+        else:
+            if verbose:
+                logger.info("[stats-pretrain] WARNING: no best_state_dict saved (maybe no epochs ran?)")
 
     def pretrain_past_reconstruction_only(
         self,
-        past_target: np.ndarray,
-        past_covariates: np.ndarray,
+        past_target: np.ndarray,        # (N,1,L) scaled
+        past_covariates: np.ndarray,    # (N,Cx,L)
         n_epochs: int = 30,
         batch_size: int = 64,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
+        # debug
         debug: bool = True,
         debug_dir: str = "./debug_no_revin_residual",
         debug_plot: bool = True,
@@ -1079,9 +1121,6 @@ class ConditionalAdaPTS:
         y_recon = decoder(latents, x_past)       # (B,1,L)
         loss = MSE(y_recon, y_past)
         """
-        if not getattr(self.adapter, "can_reconstruct_past", True):
-            logger.info("[pretrain_past_reconstruction_only] pipeline can't reconstruct -> skip.")
-            return
 
         os.makedirs(debug_dir, exist_ok=True)
 
@@ -1145,12 +1184,14 @@ class ConditionalAdaPTS:
             for (y_p, x_p) in loader:
                 y_p = y_p.to(self.device)  # (B,1,L)
                 x_p = x_p.to(self.device)  # (B,Cx,L)
-                
-                y_norm, _, _ = self.adapter.normalizer.norm_past(y_p, patch_size=P_dbg)
-                latents = self.adapter.encode(y_norm, x_p)
-                y_recon_norm = self.adapter.decode(latents, x_p)
 
-                loss = F.mse_loss(y_recon_norm, y_norm)
+                latents = self.adapter.encode(y_p, x_p)  # (B,1,L) if latent_dim=1
+                if latents.size(1) != 1:
+                    raise ValueError(f"latent_dim must be 1, got {latents.size(1)}")
+
+                y_recon = self.adapter.decode(latents, x_p)
+
+                loss = F.mse_loss(y_recon, y_p)
 
                 optim.zero_grad()
                 loss.backward()
@@ -1165,35 +1206,40 @@ class ConditionalAdaPTS:
                     logger.info("\n=========== [Pretrain past recon ONLY] DEBUG ===========")
                     logger.info(f"[dbg] epoch={epoch}/{n_epochs-1} batch={y_p.size(0)}")
 
+                    _print_stats("y_past", y_p)
+                    _print_stats("latents(trend)", latents)
+                    _print_stats("y_recon", y_recon)
+
+                    _print_patch("y_past", y_p, P_dbg, b=0)
+                    _print_patch("latents(trend)", latents, P_dbg, b=0)
+                    _print_patch("y_recon", y_recon, P_dbg, b=0)
+
+                    with torch.no_grad():
+                        perm = torch.randperm(y_p.size(0), device=self.device)
+                        y_recon_shuf_cov = self.adapter.decode(latents, x_p[perm])
+                        cov_sens = (y_recon - y_recon_shuf_cov).abs().mean().item()
+
+                        y_recon_shuf_proxy = self.adapter.decode(latents[perm], x_p)
+                        proxy_sens = (y_recon - y_recon_shuf_proxy).abs().mean().item()
+
+                        logger.info(f"[probe] decoder sensitivity cov   : {cov_sens:.4f}")
+                        logger.info(f"[probe] decoder sensitivity proxy : {proxy_sens:.4f}")
+
                     if debug_plot:
                         out_dir = os.path.join(debug_dir, "pretrain_stage1")
                         os.makedirs(out_dir, exist_ok=True)
                         i = 0
                         _plot_1d(
                             os.path.join(out_dir, f"ep{epoch:03d}_past_recon_b{i}.png"),
-                            {"y_past_norm": _to_np(y_norm[i, 0]), "y_recon_norm": _to_np(y_recon_norm[i, 0])},
-                            title=f"Stage1 past recon(norm) | ep={epoch} b={i}",
+                            {"y_past": _to_np(y_p[i, 0]), "y_recon": _to_np(y_recon[i, 0])},
+                            title=f"Stage1 past recon | ep={epoch} b={i}",
+                        )
+                        _plot_1d(
+                            os.path.join(out_dir, f"ep{epoch:03d}_trend_proxy_b{i}.png"),
+                            {"latents(trend)": _to_np(latents[i, 0]), "y_past": _to_np(y_p[i, 0])},
+                            title=f"Stage1 latent & y | ep={epoch} b={i}",
                         )
                     logger.info("=========================================================\n")
-                    
-                    _print_stats("y_past", y_p)
-                    _print_stats("latents(trend)", latents)
-                    _print_stats("y_recon", y_recon_norm)
-
-                    _print_patch("y_past", y_p, P_dbg, b=0)
-                    _print_patch("latents(trend)", latents, P_dbg, b=0)
-                    _print_patch("y_recon", y_recon_norm, P_dbg, b=0)
-
-                    with torch.no_grad():
-                        perm = torch.randperm(y_p.size(0), device=self.device)
-                        y_recon_shuf_cov = self.adapter.decode(latents, x_p[perm])
-                        cov_sens = (y_recon_norm - y_recon_shuf_cov).abs().mean().item()
-
-                        y_recon_shuf_proxy = self.adapter.decode(latents[perm], x_p)
-                        proxy_sens = (y_recon_norm - y_recon_shuf_proxy).abs().mean().item()
-
-                        logger.info(f"[probe] decoder sensitivity cov   : {cov_sens:.4f}")
-                        logger.info(f"[probe] decoder sensitivity proxy : {proxy_sens:.4f}")
 
             if verbose:
                 logger.info(f"[stage1-pretrain] epoch={epoch:03d} loss_past_recon={total/max(1,count):.6f}")     
@@ -1201,14 +1247,16 @@ class ConditionalAdaPTS:
 
     def predict(
         self,
-        past_target: np.ndarray,
-        past_covariates: np.ndarray,
-        future_covariates: np.ndarray,
-        pred_horizon: int,
+        past_target: np.ndarray,        # (B,1,L)
+        past_covariates: np.ndarray,    # (B,Cx,L)
+        future_covariates: np.ndarray,  # (B,Cx,H)
+        pred_horizon: int,              # H
         ltm_batch_size: int = 128,
         n_samples: int = 20,
+        use_patch_revin: bool = False,
         **ltm_kwargs,
     ) -> PredPack:
+
         self.adapter.train()
         self.iclearner.eval()
 
@@ -1217,51 +1265,65 @@ class ConditionalAdaPTS:
         future_covariates_tensor = torch.tensor(future_covariates, dtype=torch.float32, device=self.device)
 
         all_future_target_samples = []
-
+        
         P_past = self.adapter.revin_patch_size_past
-        P_fut = self.adapter.revin_patch_size_future
+        P_fut  = self.adapter.revin_patch_size_future
 
         for sample_idx in range(n_samples):
             with torch.no_grad():
-                past_target_norm, _, _ = self.adapter.normalizer.norm_past(past_target_tensor, patch_size=P_past)
+                
+                if use_patch_revin:
+                    past_target_norm, past_mu_t, past_std_t, _, _ = revin_patch_norm_target(
+                        past_target_tensor, patch_size=P_past
+                    )
+                else:
+                    past_target_norm, past_mu_t, past_std_t = self._identity_norm(past_target_tensor)
+                # past_covariates_aug = torch.cat([past_covariates_tensor, past_mu_t, past_std_t], dim=1)
+                past_covariates_aug = past_covariates_tensor
 
-                past_latents = self.adapter.encode(past_target_norm, past_covariates_tensor)
+                future_mu_t_hat, future_std_t_hat, _, _, _ = self.adapter.predict_future_stats(future_covariates_tensor)
+                # future_covariates_aug = torch.cat([future_covariates_tensor, future_mu_t_hat, future_std_t_hat], dim=1)
+                future_covariates_aug = future_covariates_tensor
 
-                future_latents_pred = self._predict_future_latents_with_ltm(
-                    past_latents=past_latents,
+                # residual + proxy
+                past_resid = self.adapter.encode(past_target_norm, past_covariates_tensor)
+                past_proxy = past_target_norm - past_resid
+
+                # LTM predict proxy
+                future_proxy_pred = self._predict_future_latents_with_ltm(
+                    past_latents=past_proxy,
                     future_horizon=pred_horizon,
                     ltm_batch_size=ltm_batch_size,
                     **ltm_kwargs,
                 )
 
-                future_target_pred_norm = self.adapter.decode(future_latents_pred, future_covariates_tensor)
+                # decode y from (pred proxy + future cov)
+                future_target_pred_norm = self.adapter.decode(future_proxy_pred, future_covariates_tensor)
 
-                mu_t_hat, std_t_hat, _, _, _ = self.adapter.predict_future_stats(future_covariates_tensor)
-                # IdentityNormalizer will ignore these effectively
-                mu_ref, std_ref = self.adapter.normalizer.mix_future_time_stats(
-                    mu_t_true=None, std_t_true=None,
-                    mu_t_hat=mu_t_hat, std_t_hat=std_t_hat,
-                    alpha_stats=1.0,
-                )
-                future_target_pred = self.adapter.normalizer.denorm_future_pred(
-                    y_future_pred_norm=future_target_pred_norm,
-                    mu_ref=mu_ref.detach(),
-                    std_ref=std_ref.detach(),
-                )
+                if use_patch_revin:
+                    future_target_pred = revin_patch_denorm_target(future_target_pred_norm, future_mu_t_hat, torch.clamp(future_std_t_hat,min=0.05))
+                else:
+                    future_target_pred = future_target_pred_norm
 
+                
                 all_future_target_samples.append(future_target_pred.detach().cpu().numpy())
-
+                
                 if sample_idx == 0:
                     logger.info("------------------------predict----------------------")
-                    logger.info("past_latents min/mean/max:", past_latents.min().item(), past_latents.mean().item(), past_latents.max().item())
-                    logger.info("past_latents std:", past_latents.std().item())
-                    logger.info("future_cov min/mean/max:", future_covariates_tensor.min().item(), future_covariates_tensor.mean().item(), future_covariates_tensor.max().item())
+                    logger.info("\n==== latent stats ====")
+                    # logger.info("past_latents(trend)   min/mean/max:", past_latents.min().item(), past_latents.mean().item(), past_latents.max().item())
+                    # logger.info("past_latents(trend)   std:", past_latents.std().item())
+                    logger.info("past_resid           min/mean/max:", past_resid.min().item(), past_resid.mean().item(), past_resid.max().item())
+                    logger.info("past_resid           std:", past_resid.std().item())
+                    logger.info("past_proxy           min/mean/max:", past_proxy.min().item(), past_proxy.mean().item(), past_proxy.max().item())
+                    logger.info("past_proxy           std:", past_proxy.std().item())
+
+                    logger.info("future_cov     min/mean/max:", future_covariates_tensor.min().item(), future_covariates_tensor.mean().item(), future_covariates_tensor.max().item()) 
                     logger.info("future_target_pred_norm std:", future_target_pred_norm.std().item())
 
-                    if self.adapter.has_stats_predictor:
-                        mu_patch_hat, std_patch_hat, logstd_patch_hat = self.adapter.future_stats_predictor(future_covariates_tensor)
-                        logger.info("mu_patch_hat min/mean/max:", mu_patch_hat.min().item(), mu_patch_hat.mean().item(), mu_patch_hat.max().item())
-                        logger.info("std_patch_hat min/mean/max:", std_patch_hat.min().item(), std_patch_hat.mean().item(), std_patch_hat.max().item())
+                    mu_patch_hat, std_patch_hat, _ = self.adapter.future_stats_predictor(future_covariates_tensor)
+                    logger.info("mu_patch_hat min/mean/max:", mu_patch_hat.min().item(), mu_patch_hat.mean().item(), mu_patch_hat.max().item())
+                    logger.info("std_patch_hat min/mean/max:", std_patch_hat.min().item(), std_patch_hat.mean().item(), std_patch_hat.max().item())
 
         all_future_target_samples = np.stack(all_future_target_samples, axis=0)  # (S,B,1,H)
         mean = all_future_target_samples.mean(axis=0)
