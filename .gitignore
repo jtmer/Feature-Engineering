@@ -16,5 +16,10 @@ gnn_moe_transformer_torch.py
 debug_no_revin_residual/
 debug_train_adapter/
 results_monthly_backtest/
+results_monthly_backtest*/
+results/
+analysis_results/
 swanlog/
 vis_conditional_adapts/
+
+batch_failed_jobs.jsonl

@@ -5,6 +5,7 @@ from typing import Optional, Tuple, List, Dict, Any
 
 import copy
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -233,7 +234,8 @@ class PlotDumper(Callback):
         future_target_true = dbg["future_target_true"]
 
         future_latents_true = dbg["future_latents_true"]
-        future_cov_aug_true = dbg["future_covariates_aug_true"]
+        future_cov_aug_true = dbg.get("future_covariates_aug_true", dbg.get("future_covariates_true", None))
+        adapter_decode = dbg.get("adapter_decode", state.get("adapter", None).decode if state.get("adapter", None) is not None else None)
 
         mu_ref = dbg["mu_ref"]
         std_ref = dbg["std_ref"]
@@ -337,18 +339,21 @@ class PlotDumper(Callback):
             logger.info("[debug] patch std (raw) pred:", pred4_raw.std(dim=-1).mean().item(),
                   "| true:", true4_raw.std(dim=-1).mean().item())
 
-            z = future_latents_true
-            y1 = dbg["adapter_decode"](z, future_cov_aug_true)
-            y2 = dbg["adapter_decode"](z, future_cov_aug_true[torch.randperm(z.size(0))])
-            diff = (y1 - y2).abs().mean().item()
-            logger.info("[probe] decoder sensitivity to cov:", diff)
+            if (future_cov_aug_true is not None) and (adapter_decode is not None):
+                z = future_latents_true
+                y1 = adapter_decode(z, future_cov_aug_true)
+                y2 = adapter_decode(z, future_cov_aug_true[torch.randperm(z.size(0), device=z.device)])
+                diff = (y1 - y2).abs().mean().item()
+                logger.info("[probe] decoder sensitivity to cov:", diff)
 
-            z1 = future_latents_true
-            z2 = future_latents_true[torch.randperm(z1.size(0))]
-            y1 = dbg["adapter_decode"](z1, future_cov_aug_true)
-            y2 = dbg["adapter_decode"](z2, future_cov_aug_true)
-            diffz = (y1 - y2).abs().mean().item()
-            logger.info("[probe] decoder sensitivity to latents(proxy):", diffz)
+                z1 = future_latents_true
+                z2 = future_latents_true[torch.randperm(z1.size(0), device=z1.device)]
+                y1 = adapter_decode(z1, future_cov_aug_true)
+                y2 = adapter_decode(z2, future_cov_aug_true)
+                diffz = (y1 - y2).abs().mean().item()
+                logger.info("[probe] decoder sensitivity to latents(proxy):", diffz)
+            else:
+                logger.info("[probe] skip decoder sensitivity probes: missing future covariates or adapter_decode")
 
         logger.info("================================================\n")
 
@@ -444,9 +449,9 @@ class ConditionalAdaPTS:
         future_std = future_latents.std(dim=-1)
         return F.mse_loss(past_mu, future_mu) + F.mse_loss(past_std, future_std)
 
-    # def _compute_alpha_stats(self, epoch: int, n_epochs: int) -> float:
-    #     progress = epoch / max(1, n_epochs - 1)
-    #     return float(np.clip((progress - 0.1) / 0.4, 0.0, 1.0))
+    def _compute_alpha_stats(self, epoch: int, n_epochs: int) -> float:
+        progress = epoch / max(1, n_epochs - 1)
+        return float(np.clip((progress - 0.1) / 0.4, 0.0, 1.0))
 
     # def _norm_past(self, y_past: torch.Tensor, patch_size: int, use_patch_revin: bool):
     #     if use_patch_revin:
@@ -536,11 +541,12 @@ class ConditionalAdaPTS:
         x_future: torch.Tensor,
         *,
         alpha_stats: float,
-        use_patch_revin: bool,
+        # use_patch_revin: bool,
         ltm_batch_size: int,
         loss_weights: Dict[str, float],
         mode: str,  # "train" or "val"
         debug_collect: bool = False,
+        block_future_pred_to_decoder: bool = False,
     ) -> Dict[str, Any]:
         """
         返回：
@@ -601,6 +607,7 @@ class ConditionalAdaPTS:
         )
         
         future_target_pred_norm = self.adapter.decode(future_latents_pred, x_future)
+
         future_target_pred = self.adapter.normalizer.denorm_future_pred(
             y_future_pred_norm=future_target_pred_norm,
             mu_ref=mu_ref.detach(),
@@ -687,6 +694,9 @@ class ConditionalAdaPTS:
                 "P_fut": P_fut,
                 "past_latents": past_latents.detach(),
                 "future_latents_pred": future_latents_pred.detach(),
+                "future_latents_true": future_latents_true.detach(),
+                "future_covariates_true": x_future.detach(),
+                "adapter_decode": self.adapter.decode,
                 "past_target_norm": y_past_norm.detach(),
                 "past_target_recon_norm": past_target_recon_norm.detach(),
                 "future_target_pred_norm": future_target_pred_norm.detach(),
@@ -696,7 +706,6 @@ class ConditionalAdaPTS:
                 "mu_ref": mu_ref.detach(),
                 "std_ref": std_ref.detach(),
             }
-
         return out
 
     def _run_epoch(
@@ -706,11 +715,12 @@ class ConditionalAdaPTS:
         epoch: int,
         n_epochs: int,
         mode: str,  # train or eval
-        optimizer: Optional[torch.optim.Optimizer],
+        optimizer: Optional[Any],
         ltm_batch_size: int,
         loss_weights: Dict[str, float],
         callbacks: Optional[List[Callback]] = None,
         debug_every: int = 3,
+        block_future_pred_to_decoder: bool = False,
     ) -> Dict[str, float]:
         is_train = (mode == "train")
         if is_train:
@@ -724,6 +734,14 @@ class ConditionalAdaPTS:
         meter = EpochMeters.new(keys=["loss", "past_recon", "future_pred", "latent_stats", "stats_pred", "y_patch_moment"])
         want_debug = (mode == "train") and (epoch % debug_every == 0)
 
+        dual_optimizer_mode = (
+            is_train
+            and block_future_pred_to_decoder
+            and isinstance(optimizer, dict)
+            and ("encoder" in optimizer)
+            and ("decoder" in optimizer)
+        )
+
         for (y_p, x_p, y_f, x_f) in dataloader:
             y_p = y_p.to(self.device)
             x_p = x_p.to(self.device)
@@ -733,25 +751,79 @@ class ConditionalAdaPTS:
             debug_collect = want_debug
 
             with torch.set_grad_enabled(is_train):
-                out = self._forward_once(
-                    y_past=y_p,
-                    x_past=x_p,
-                    y_future=y_f,
-                    x_future=x_f,
-                    alpha_stats=alpha_stats,
-                    ltm_batch_size=ltm_batch_size,
-                    loss_weights=loss_weights,
-                    mode=mode,
-                    debug_collect=debug_collect,
-                )
+                if dual_optimizer_mode:
+                    optimizer_decoder = optimizer["decoder"]
+                    optimizer_encoder = optimizer["encoder"]
 
-                if is_train:
-                    optimizer.zero_grad()
+                    # -------------------------
+                    # decoder step: past reconstruction only
+                    # -------------------------
+                    optimizer_decoder.zero_grad()
+                    optimizer_encoder.zero_grad()
+
+                    out_dec = self._forward_once(
+                        y_past=y_p,
+                        x_past=x_p,
+                        y_future=y_f,
+                        x_future=x_f,
+                        alpha_stats=alpha_stats,
+                        ltm_batch_size=ltm_batch_size,
+                        loss_weights=loss_weights,
+                        mode=mode,
+                        debug_collect=False,
+                        block_future_pred_to_decoder=False,
+                    )
+                    out_dec["losses"]["past_recon"].backward()
+                    optimizer_decoder.step()
+
+                    # 清掉第一次 backward 在 encoder / decoder 上留下的梯度
+                    optimizer_encoder.zero_grad()
+                    optimizer_decoder.zero_grad()
+
+                    # -------------------------
+                    # encoder step: total loss = past + future + others
+                    # -------------------------
+                    out = self._forward_once(
+                        y_past=y_p,
+                        x_past=x_p,
+                        y_future=y_f,
+                        x_future=x_f,
+                        alpha_stats=alpha_stats,
+                        ltm_batch_size=ltm_batch_size,
+                        loss_weights=loss_weights,
+                        mode=mode,
+                        debug_collect=debug_collect,
+                        block_future_pred_to_decoder=False,
+                    )
                     out["losses"]["loss"].backward()
-                    optimizer.step()
+                    optimizer_encoder.step()
+
+                    # 清掉第二次 backward 在 decoder 上产生但不用于更新的梯度
+                    optimizer_decoder.zero_grad()
 
                     if want_debug:
                         want_debug = False
+                else:
+                    out = self._forward_once(
+                        y_past=y_p,
+                        x_past=x_p,
+                        y_future=y_f,
+                        x_future=x_f,
+                        alpha_stats=alpha_stats,
+                        ltm_batch_size=ltm_batch_size,
+                        loss_weights=loss_weights,
+                        mode=mode,
+                        debug_collect=debug_collect,
+                        block_future_pred_to_decoder=block_future_pred_to_decoder,
+                    )
+
+                    if is_train:
+                        optimizer.zero_grad()
+                        out["losses"]["loss"].backward()
+                        optimizer.step()
+
+                        if want_debug:
+                            want_debug = False
 
             bsz = y_p.size(0)
             meter.update(out["losses"], bsz)
@@ -763,6 +835,7 @@ class ConditionalAdaPTS:
                     "alpha_stats": alpha_stats,
                     "out": out,
                     "debug": out.get("debug", None),
+                    "adapter": self.adapter,
                 }
                 for cb in callbacks:
                     cb.on_batch_end(state)
@@ -808,18 +881,45 @@ class ConditionalAdaPTS:
         debug_num_seq: int = 2,
         debug_latent_ch: int = 1,
         earlystop_patience: int = 10,
+        # ===== new args =====
+        freeze_decoder: bool = False,
+        block_future_pred_to_decoder: bool = False,
+        encoder_lr: Optional[float] = None,
+        decoder_lr: Optional[float] = None,
+        stats_lr: Optional[float] = None,
+        
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
     ):
+        
+        self.adapter.train()
         if not getattr(self.adapter, "is_trainable", True):
             logger.info("[train_adapter] adapter is not trainable -> skip.")
             return
-        
-        dataset = TensorDataset(
+
+        train_dataset = TensorDataset(
             torch.tensor(past_target, dtype=torch.float32),
             torch.tensor(past_covariates, dtype=torch.float32),
             torch.tensor(future_target, dtype=torch.float32),
             torch.tensor(future_covariates, dtype=torch.float32),
         )
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        dl_kwargs = dict(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = persistent_workers
+            dl_kwargs["prefetch_factor"] = prefetch_factor
+
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            **dl_kwargs,
+        )
 
         val_loader = None
         if val_data is not None:
@@ -829,13 +929,165 @@ class ConditionalAdaPTS:
                 torch.tensor(val_data["future_target"], dtype=torch.float32),
                 torch.tensor(val_data["future_covariates"], dtype=torch.float32),
             )
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            val_loader = DataLoader(
+                val_dataset,
+                shuffle=False,
+                **dl_kwargs,
+            )
 
-        optimizer = torch.optim.Adam(self.adapter.parameters(), lr=lr, weight_decay=weight_decay)
+        # -------------------------
+        # freeze / unfreeze decoder
+        # -------------------------
+        if hasattr(self.adapter, "decoder"):
+            if freeze_decoder:
+                for p in self.adapter.decoder.parameters():
+                    p.requires_grad_(False)
+                logger.info("[train_adapter] decoder frozen.")
+            else:
+                for p in self.adapter.decoder.parameters():
+                    p.requires_grad_(True)
 
         self.iclearner.eval()
         for p in self.iclearner.backbone.parameters():
             p.requires_grad_(False)
+
+        # -------------------------
+        # optimizer with param groups
+        # -------------------------
+        enc_lr = lr if encoder_lr is None else encoder_lr
+        dec_lr = lr if decoder_lr is None else decoder_lr
+        st_lr = lr if stats_lr is None else stats_lr
+
+        known_param_ids = set()
+
+        def _unique_trainable_params(module):
+            params = []
+            if module is None:
+                return params
+            for p in module.parameters():
+                if (not p.requires_grad) or (id(p) in known_param_ids):
+                    continue
+                params.append(p)
+                known_param_ids.add(id(p))
+            return params
+
+        enc_params = []
+        dec_params = []
+        stats_params = []
+
+        if hasattr(self.adapter, "encoder") and self.adapter.encoder is not None:
+            enc_params = _unique_trainable_params(self.adapter.encoder)
+
+        if hasattr(self.adapter, "decoder") and self.adapter.decoder is not None:
+            dec_params = _unique_trainable_params(self.adapter.decoder)
+
+        if hasattr(self.adapter, "future_stats_predictor") and self.adapter.future_stats_predictor is not None:
+            stats_params = _unique_trainable_params(self.adapter.future_stats_predictor)
+
+        # 其余还可训练的参数（如 normalizer 等），默认跟 encoder_lr
+        other_params = []
+        for p in self.adapter.parameters():
+            if (not p.requires_grad) or (id(p) in known_param_ids):
+                continue
+            other_params.append(p)
+            known_param_ids.add(id(p))
+            
+            
+        def _count_trainable(module):
+            if module is None:
+                return 0, 0
+            total = 0
+            trainable = 0
+            for p in module.parameters():
+                n = p.numel()
+                total += n
+                if p.requires_grad:
+                    trainable += n
+            return total, trainable
+
+        enc_total, enc_train = _count_trainable(getattr(self.adapter, "encoder", None))
+        dec_total, dec_train = _count_trainable(getattr(self.adapter, "decoder", None))
+        fsp_total, fsp_train = _count_trainable(getattr(self.adapter, "future_stats_predictor", None))
+        ada_total, ada_train = _count_trainable(self.adapter)
+
+        logger.info(f"[train_adapter] encoder total/trainable: {enc_total}/{enc_train}")
+        logger.info(f"[train_adapter] decoder total/trainable: {dec_total}/{dec_train}")
+        logger.info(f"[train_adapter] future_stats_predictor total/trainable: {fsp_total}/{fsp_train}")
+        logger.info(f"[train_adapter] adapter total/trainable: {ada_total}/{ada_train}")
+
+        optimizer = None
+        dual_optimizer_mode = block_future_pred_to_decoder and (len(dec_params) > 0)
+
+        if dual_optimizer_mode:
+            encoder_param_groups = []
+            if len(enc_params) > 0:
+                encoder_param_groups.append({
+                    "params": enc_params,
+                    "lr": enc_lr,
+                })
+            if len(stats_params) > 0:
+                encoder_param_groups.append({
+                    "params": stats_params,
+                    "lr": st_lr,
+                })
+            if len(other_params) > 0:
+                encoder_param_groups.append({
+                    "params": other_params,
+                    "lr": enc_lr,
+                })
+
+            if len(encoder_param_groups) == 0:
+                logger.info("[train_adapter] block_future_pred_to_decoder=True but encoder-side trainable params are empty -> fallback to single optimizer.")
+                dual_optimizer_mode = False
+            else:
+                optimizer = {
+                    "encoder": torch.optim.Adam(encoder_param_groups, weight_decay=weight_decay),
+                    "decoder": torch.optim.Adam([
+                        {
+                            "params": dec_params,
+                            "lr": dec_lr,
+                        }
+                    ], weight_decay=weight_decay),
+                }
+
+        if not dual_optimizer_mode:
+            param_groups = []
+            if len(enc_params) > 0:
+                param_groups.append({
+                    "params": enc_params,
+                    "lr": enc_lr,
+                })
+            if len(dec_params) > 0:
+                param_groups.append({
+                    "params": dec_params,
+                    "lr": dec_lr,
+                })
+            if len(stats_params) > 0:
+                param_groups.append({
+                    "params": stats_params,
+                    "lr": st_lr,
+                })
+            if len(other_params) > 0:
+                param_groups.append({
+                    "params": other_params,
+                    "lr": enc_lr,
+                })
+
+            if len(param_groups) == 0:
+                logger.info("[train_adapter] no trainable params -> skip.")
+                return
+
+            optimizer = torch.optim.Adam(param_groups, weight_decay=weight_decay)
+
+        logger.info(
+            f"[train_adapter] optimizer groups | "
+            f"freeze_decoder={freeze_decoder} "
+            f"block_future_pred_to_decoder={block_future_pred_to_decoder} "
+            f"dual_optimizer_mode={dual_optimizer_mode} "
+            f"encoder_lr={enc_lr:.2e} "
+            f"decoder_lr={dec_lr:.2e} "
+            f"stats_lr={st_lr:.2e}"
+        )
 
         loss_weights = {
             "past_recon": lambda_past_recon,
@@ -847,8 +1099,7 @@ class ConditionalAdaPTS:
 
         callbacks: List[Callback] = []
         if verbose:
-            callbacks.append(ConsoleLogger())
-
+            callbacks.append(ConsoleLogger(print_earlystop=True))
         if debug:
             callbacks.append(
                 PlotDumper(
@@ -860,12 +1111,18 @@ class ConditionalAdaPTS:
                 )
             )
 
-        earlystop = EarlyStopper(patience=earlystop_patience, verbose=verbose)
-        callbacks.append(earlystop)
+        early_stopper = None
+        if val_loader is not None:
+            early_stopper = EarlyStopper(
+                patience=earlystop_patience,
+                min_delta=1e-4,
+                verbose=verbose,
+            )
+            callbacks.append(early_stopper)
 
-        for epoch in range(n_epochs):
+        for epoch in range(1, n_epochs + 1):
             train_metrics = self._run_epoch(
-                dataloader=train_loader,
+                train_loader,
                 epoch=epoch,
                 n_epochs=n_epochs,
                 mode="train",
@@ -874,48 +1131,39 @@ class ConditionalAdaPTS:
                 loss_weights=loss_weights,
                 callbacks=callbacks,
                 debug_every=debug_every,
+                block_future_pred_to_decoder=block_future_pred_to_decoder,
             )
 
-            if use_swanlab and (swanlab_run is not None):
-                log_dict = {f"train/{k}": v for k, v in train_metrics.items()}
-                log_dict["epoch"] = epoch
-                swanlab_run.log(log_dict)
-
             if val_loader is not None:
-                val_metrics = self._run_epoch(
-                    dataloader=val_loader,
-                    epoch=epoch,
-                    n_epochs=n_epochs,
-                    mode="val",
-                    optimizer=None,
-                    ltm_batch_size=ltm_batch_size,
-                    loss_weights=loss_weights,
-                    callbacks=callbacks,
-                    debug_every=debug_every,
-                )
+                with torch.no_grad():
+                    val_metrics = self._run_epoch(
+                        val_loader,
+                        epoch=epoch,
+                        n_epochs=n_epochs,
+                        mode="val",
+                        optimizer=None,
+                        ltm_batch_size=ltm_batch_size,
+                        loss_weights=loss_weights,
+                        callbacks=callbacks,
+                        debug_every=debug_every,
+                        block_future_pred_to_decoder=block_future_pred_to_decoder,
+                    )
 
-                if use_swanlab and (swanlab_run is not None):
-                    log_dict = {f"val/{k}": v for k, v in val_metrics.items()}
-                    log_dict["epoch"] = epoch
-                    swanlab_run.log(log_dict)
+                if early_stopper is not None and early_stopper.should_stop:
+                    logger.info(
+                        f"[train_adapter] early stop at epoch={epoch}, "
+                        f"best_epoch={early_stopper.best_epoch}, "
+                        f"best_loss={early_stopper.best_value:.6f}"
+                    )
+                    break
 
-            else:
-                fake_val_state = {
-                    "mode": "val",
-                    "epoch": epoch,
-                    "metrics": train_metrics,
-                    "adapter": self.adapter,
-                }
-                earlystop.on_epoch_end(fake_val_state)
-
-            if earlystop.should_stop:
-                break
-
-        if earlystop.best_state_dict is not None:
-            self.adapter.load_state_dict(earlystop.best_state_dict)
-            if verbose:
-                logger.info(f"[earlystop] restored best adapter weights from epoch={earlystop.best_epoch} "
-                            f"(best_loss={earlystop.best_value:.6f})")
+        if early_stopper is not None and early_stopper.best_state_dict is not None:
+            self.adapter.load_state_dict(early_stopper.best_state_dict)
+            logger.info(
+                f"[train_adapter] restored best adapter from epoch="
+                f"{early_stopper.best_epoch} "
+                f"(val_loss={early_stopper.best_value:.6f})"
+            )
     
     
     def pretrain_stats_predictor(
@@ -1062,22 +1310,54 @@ class ConditionalAdaPTS:
 
     def pretrain_past_reconstruction_only(
         self,
-        past_target: np.ndarray,
-        past_covariates: np.ndarray,
+        past_target: np.ndarray,        # (N,1,L) scaled
+        past_covariates: np.ndarray,    # (N,Cx,L)
         n_epochs: int = 30,
+        min_n_epochs: int = 30,
         batch_size: int = 64,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
+        # early stop
+        val_data: Optional[Dict[str, np.ndarray]] = None,
+        patience: int = 10,
+        min_delta: float = 1e-4,
+        # anti-shortcut regularization
+        lambda_proxy_floor: float = 0.2,
+        proxy_sens_floor: float = 0.10,
+        lambda_ratio_floor: float = 0.2,
+        proxy_cov_ratio_floor: float = 0.20,
+        # early-stop monitor on proxy usage
+        lambda_monitor: float = 1.0,
+        # lambda_latent_l2: float = 0.5,
+        # latent scale regularization (replace raw latent L2)
+        lambda_latent_scale: float = 1e-4,
+        latent_rms_target: float = 3.0,
+        latent_std_floor=0.3,
+        lambda_latent_std_floor = 1.0,
+        # debug
         debug: bool = True,
         debug_dir: str = "./debug_no_revin_residual",
         debug_plot: bool = True,
         debug_num_seq: int = 2,
         verbose: bool = True,
+        
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
     ):
         """
-        latents = encoder(y_past, x_past)      # (B,1,L)
-        y_recon = decoder(latents, x_past)       # (B,1,L)
-        loss = MSE(y_recon, y_past)
+        Stage1: pretrain past reconstruction only
+
+        latents = encoder(y_past_norm, x_past)    # (B,z_dim,L)
+        y_recon = decoder(latents, x_past)        # (B,1,L)
+
+        Base loss:
+            recon_loss = MSE(y_recon_norm, y_past_norm)
+
+        Anti-shortcut regularization:
+            1) proxy floor: force decoder to use latent/proxy
+            2) proxy/cov ratio floor: prevent severe cov shortcut
         """
         if not getattr(self.adapter, "can_reconstruct_past", True):
             logger.info("[pretrain_past_reconstruction_only] pipeline can't reconstruct -> skip.")
@@ -1090,31 +1370,34 @@ class ConditionalAdaPTS:
 
         def _print_stats(name: str, x: torch.Tensor):
             x_ = x.detach()
-            logger.info(f"[dbg] {name:28s} shape={tuple(x_.shape)} "
-                f"min={x_.min().item():.4g} mean={x_.mean().item():.4g} max={x_.max().item():.4g} std={x_.std().item():.4g}")
+            logger.info(
+                f"[dbg] {name:28s} shape={tuple(x_.shape)} "
+                f"min={x_.min().item():.4g} mean={x_.mean().item():.4g} "
+                f"max={x_.max().item():.4g} std={x_.std().item():.4g}"
+            )
 
         def _patch_stats(x: torch.Tensor, patch: int):
-            # x: (B,1,T)
             B, C, T = x.shape
-            assert C == 1
             if patch <= 1 or (T % patch != 0):
-                mu = x.mean(dim=-1, keepdim=True)  # (B,1,1)
+                mu = x.mean(dim=-1, keepdim=True)   # (B,C,1)
                 sd = x.std(dim=-1, keepdim=True)
                 return mu, sd
             Np = T // patch
-            x4 = x.view(B, 1, Np, patch)
-            mu = x4.mean(dim=-1)  # (B,1,Np)
-            sd = x4.std(dim=-1)   # (B,1,Np)
+            x4 = x.view(B, C, Np, patch)
+            mu = x4.mean(dim=-1)  # (B,C,Np)
+            sd = x4.std(dim=-1)   # (B,C,Np)
             return mu, sd
 
-        def _print_patch(name: str, x: torch.Tensor, patch: int, b: int = 0, k: int = 6):
+        def _print_patch(name: str, x: torch.Tensor, patch: int, b: int = 0, c: int = 0, k: int = 6):
             mu, sd = _patch_stats(x, patch)
-            mu_np = mu[b, 0, :min(k, mu.shape[-1])].detach().cpu().numpy()
-            sd_np = sd[b, 0, :min(k, sd.shape[-1])].detach().cpu().numpy()
+            mu_np = mu[b, c, :min(k, mu.shape[-1])].detach().cpu().numpy()
+            sd_np = sd[b, c, :min(k, sd.shape[-1])].detach().cpu().numpy()
             logger.info(f"[dbg] {name:28s} patch_mean[:{k}]={mu_np}")
             logger.info(f"[dbg] {name:28s} patch_std [: {k}]={sd_np}")
-            logger.info(f"[dbg] {name:28s} patch_std summary min/mean/max="
-                f"{sd.min().item():.4g}/{sd.mean().item():.4g}/{sd.max().item():.4g}")
+            logger.info(
+                f"[dbg] {name:28s} patch_std summary min/mean/max="
+                f"{sd.min().item():.4g}/{sd.mean().item():.4g}/{sd.max().item():.4g}"
+            )
 
         def _plot_1d(save_path: str, curves: dict, title: str):
             plt.figure(figsize=(14, 4))
@@ -1126,78 +1409,390 @@ class ConditionalAdaPTS:
             plt.savefig(save_path, dpi=150)
             plt.close()
 
-        dataset = TensorDataset(
+        def _batch_probe_metrics(latents: torch.Tensor, x_p: torch.Tensor, y_recon_norm: torch.Tensor):
+            """
+            Compute decoder sensitivity to:
+            - covariates shuffle
+            - latent/proxy shuffle
+            """
+            with torch.no_grad():
+                B = y_recon_norm.size(0)
+                if B <= 1:
+                    # 无法 shuffle 时返回 0，避免 nan
+                    zero = torch.tensor(0.0, device=y_recon_norm.device)
+                    return zero, zero
+
+                perm = torch.randperm(B, device=y_recon_norm.device)
+
+                y_recon_shuf_cov = self.adapter.decode(latents, x_p[perm])
+                cov_sens = (y_recon_norm - y_recon_shuf_cov).abs().mean()
+
+                y_recon_shuf_proxy = self.adapter.decode(latents[perm], x_p)
+                proxy_sens = (y_recon_norm - y_recon_shuf_proxy).abs().mean()
+
+            return cov_sens, proxy_sens
+
+        train_dataset = TensorDataset(
             torch.tensor(past_target, dtype=torch.float32),
             torch.tensor(past_covariates, dtype=torch.float32),
         )
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        dl_kwargs = dict(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = persistent_workers
+            dl_kwargs["prefetch_factor"] = prefetch_factor
+
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            **dl_kwargs,
+        )
+
+        val_loader = None
+        if val_data is not None:
+            assert "past_target" in val_data and "past_covariates" in val_data, \
+                "val_data for pretrain_past_reconstruction_only must contain 'past_target' and 'past_covariates'"
+            val_dataset = TensorDataset(
+                torch.tensor(val_data["past_target"], dtype=torch.float32),
+                torch.tensor(val_data["past_covariates"], dtype=torch.float32),
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                shuffle=False,
+                **dl_kwargs,
+            )
 
         self.adapter.train()
         optim = torch.optim.Adam(self.adapter.parameters(), lr=lr, weight_decay=weight_decay)
 
         P_dbg = getattr(self.adapter, "revin_patch_size_past", 24)
+        eps = 1e-6
 
-        for epoch in range(n_epochs):
-            total = 0.0
+        best_monitor = float("inf")
+        best_epoch = -1
+        best_state_dict = None
+        bad_count = 0
+
+        history = {
+            "epoch": [],
+            "train_loss": [],
+            "val_loss": [],
+            "train_recon_loss": [],
+            "val_recon_loss": [],
+            "train_proxy_sens": [],
+            "train_cov_sens": [],
+            "val_proxy_sens": [],
+            "val_cov_sens": [],
+            "train_proxy_cov_ratio": [],
+            "val_proxy_cov_ratio": [],
+            "train_monitor": [],
+            "val_monitor": [],
+            "train_loss_proxy_floor": [],
+            "train_loss_ratio_floor": [],
+            "train_loss_latent_scale": [],
+            "val_loss_latent_scale": [],
+            "train_loss_latent_std": [],
+            "val_loss_latent_std": [],
+            "train_latent_rms": [],
+            "val_latent_rms": [],
+        }
+
+        def _run_one_epoch(loader, is_train: bool, epoch: int):
+            if is_train:
+                self.adapter.train()
+            else:
+                self.adapter.eval()
+
+            total_loss = 0.0
+            total_recon = 0.0
+            total_proxy_floor = 0.0
+            total_ratio_floor = 0.0
+            total_latent_scale = 0.0
+            total_latent_std = 0.0
+            total_latent_rms = 0.0
+            total_cov_sens = 0.0
+            total_proxy_sens = 0.0
+            total_ratio = 0.0
             count = 0
             dumped = False
 
             for (y_p, x_p) in loader:
                 y_p = y_p.to(self.device)  # (B,1,L)
                 x_p = x_p.to(self.device)  # (B,Cx,L)
-                
-                y_norm, _, _ = self.adapter.normalizer.norm_past(y_p, patch_size=P_dbg)
-                latents = self.adapter.encode(y_norm, x_p)
-                y_recon_norm = self.adapter.decode(latents, x_p)
 
-                loss = F.mse_loss(y_recon_norm, y_norm)
+                with torch.set_grad_enabled(is_train):
+                    y_norm, _, _ = self.adapter.normalizer.norm_past(y_p, patch_size=P_dbg)
+                    latents = self.adapter.encode(y_norm, x_p)
+                    y_recon_norm = self.adapter.decode(latents, x_p)
 
-                optim.zero_grad()
-                loss.backward()
-                optim.step()
+                    recon_loss = F.mse_loss(y_recon_norm, y_norm)
 
-                total += loss.item() * y_p.size(0)
-                count += y_p.size(0)
+                    # ----- latent scale penalty: only penalize "too large", not "too small" -----
+                    latent_rms = torch.sqrt(torch.mean(latents ** 2) + 1e-8)
+                    loss_latent_scale = F.relu(
+                        latent_rms - torch.tensor(latent_rms_target, device=self.device, dtype=latents.dtype)
+                    ) ** 2
 
-                # sanity + debug 每个 epoch 第一个 batch
-                if debug and (not dumped):
+                    cov_sens, proxy_sens = _batch_probe_metrics(latents, x_p, y_recon_norm)
+                    proxy_cov_ratio = proxy_sens / (cov_sens + eps)
+
+                    # anti-shortcut regularization
+                    loss_proxy_floor = F.relu(
+                        torch.tensor(proxy_sens_floor, device=self.device, dtype=y_recon_norm.dtype) - proxy_sens
+                    )
+                    loss_ratio_floor = F.relu(
+                        torch.tensor(proxy_cov_ratio_floor, device=self.device, dtype=y_recon_norm.dtype) - proxy_cov_ratio
+                    )
+                    
+                    # 防止latent坍缩为常数
+                    latent_std = latents.std(dim=-1).mean()
+                    loss_latent_std_floor = F.relu(
+                        torch.tensor(latent_std_floor, device=self.device, dtype=latents.dtype) - latent_std
+                    ) ** 2
+
+                    if is_train:
+                        loss = (
+                            recon_loss
+                            + lambda_proxy_floor * loss_proxy_floor
+                            + lambda_ratio_floor * loss_ratio_floor
+                            + lambda_latent_scale * loss_latent_scale
+                            + lambda_latent_std_floor * loss_latent_std_floor
+                        )
+                    else:
+                        # validation loss本体只看recon；scale/probe只做记录和monitor
+                        loss = recon_loss
+
+                    if is_train:
+                        optim.zero_grad()
+                        loss.backward()
+                        optim.step()
+
+                bsz = y_p.size(0)
+                total_loss += float(loss.detach().item()) * bsz
+                total_recon += float(recon_loss.detach().item()) * bsz
+                total_proxy_floor += float(loss_proxy_floor.detach().item()) * bsz
+                total_ratio_floor += float(loss_ratio_floor.detach().item()) * bsz
+                total_latent_scale += float(loss_latent_scale.detach().item()) * bsz
+                total_latent_rms += float(latent_rms.detach().item()) * bsz
+                total_cov_sens += float(cov_sens.detach().item()) * bsz
+                total_proxy_sens += float(proxy_sens.detach().item()) * bsz
+                total_latent_std += float(loss_latent_std_floor.detach().item()) * bsz
+                total_ratio += float(proxy_cov_ratio.detach().item()) * bsz
+                count += bsz
+
+                if is_train and debug and (not dumped) and (epoch % 10 == 0):
                     dumped = True
                     logger.info("\n=========== [Pretrain past recon ONLY] DEBUG ===========")
                     logger.info(f"[dbg] epoch={epoch}/{n_epochs-1} batch={y_p.size(0)}")
 
-                    if debug_plot:
+                    if debug_plot and epoch % 20 == 0:
                         out_dir = os.path.join(debug_dir, "pretrain_stage1")
                         os.makedirs(out_dir, exist_ok=True)
-                        i = 0
-                        _plot_1d(
-                            os.path.join(out_dir, f"ep{epoch:03d}_past_recon_b{i}.png"),
-                            {"y_past_norm": _to_np(y_norm[i, 0]), "y_recon_norm": _to_np(y_recon_norm[i, 0])},
-                            title=f"Stage1 past recon(norm) | ep={epoch} b={i}",
-                        )
-                    logger.info("=========================================================\n")
-                    
+                        n_show = min(debug_num_seq, y_p.size(0))
+                        for i in range(n_show):
+                            _plot_1d(
+                                os.path.join(out_dir, f"ep{epoch:03d}_past_recon_b{i}.png"),
+                                {
+                                    "y_past_norm": _to_np(y_norm[i, 0]),
+                                    "y_recon_norm": _to_np(y_recon_norm[i, 0]),
+                                },
+                                title=f"Stage1 past recon(norm) | ep={epoch} b={i}",
+                            )
+
                     _print_stats("y_past", y_p)
+                    _print_stats("y_past_norm", y_norm)
                     _print_stats("latents(trend)", latents)
-                    _print_stats("y_recon", y_recon_norm)
+                    _print_stats("y_recon_norm", y_recon_norm)
 
-                    _print_patch("y_past", y_p, P_dbg, b=0)
-                    _print_patch("latents(trend)", latents, P_dbg, b=0)
-                    _print_patch("y_recon", y_recon_norm, P_dbg, b=0)
+                    _print_patch("y_past", y_p, P_dbg, b=0, c=0)
+                    _print_patch("y_past_norm", y_norm, P_dbg, b=0, c=0)
+                    _print_patch("latents(trend)", latents, P_dbg, b=0, c=0)
+                    _print_patch("y_recon_norm", y_recon_norm, P_dbg, b=0, c=0)
 
-                    with torch.no_grad():
-                        perm = torch.randperm(y_p.size(0), device=self.device)
-                        y_recon_shuf_cov = self.adapter.decode(latents, x_p[perm])
-                        cov_sens = (y_recon_norm - y_recon_shuf_cov).abs().mean().item()
+                    logger.info(f"[probe] decoder sensitivity cov   : {float(cov_sens.detach().item()):.4f}")
+                    logger.info(f"[probe] decoder sensitivity proxy : {float(proxy_sens.detach().item()):.4f}")
+                    logger.info(f"[probe] proxy/cov ratio          : {float(proxy_cov_ratio.detach().item()):.4f}")
+                    logger.info(f"[loss ] recon                    : {float(recon_loss.detach().item()):.6f}")
+                    logger.info(f"[loss ] proxy_floor              : {float(loss_proxy_floor.detach().item()):.6f}")
+                    logger.info(f"[loss ] ratio_floor              : {float(loss_ratio_floor.detach().item()):.6f}")
+                    logger.info(f"[loss ] latent_scale             : {float(loss_latent_scale.detach().item()):.6f}")
+                    logger.info(f"[loss ] latent_std               : {float(loss_latent_std_floor.detach().item()):.6f}")
+                    logger.info(f"[stat ] latent_rms               : {float(latent_rms.detach().item()):.6f}")
+                    logger.info("=========================================================\n")
 
-                        y_recon_shuf_proxy = self.adapter.decode(latents[perm], x_p)
-                        proxy_sens = (y_recon_norm - y_recon_shuf_proxy).abs().mean().item()
+            den = max(1, count)
+            mean_loss = total_loss / den
+            mean_recon = total_recon / den
+            mean_proxy_floor = total_proxy_floor / den
+            mean_ratio_floor = total_ratio_floor / den
+            mean_latent_scale = total_latent_scale / den
+            mean_latent_std = total_latent_std / den
+            mean_latent_rms = total_latent_rms / den
+            mean_cov_sens = total_cov_sens / den
+            mean_proxy_sens = total_proxy_sens / den
+            mean_ratio = total_ratio / den
 
-                        logger.info(f"[probe] decoder sensitivity cov   : {cov_sens:.4f}")
-                        logger.info(f"[probe] decoder sensitivity proxy : {proxy_sens:.4f}")
+            # early-stop / selection monitor:
+            # reconstruction + penalty if proxy_sens is too small
+            monitor = mean_recon + lambda_monitor * max(0.0, proxy_sens_floor - mean_proxy_sens)
 
+            return dict(
+                loss=mean_loss,
+                recon_loss=mean_recon,
+                loss_proxy_floor=mean_proxy_floor,
+                loss_ratio_floor=mean_ratio_floor,
+                loss_latent_scale=mean_latent_scale,
+                loss_latent_std=mean_latent_std,
+                latent_rms=mean_latent_rms,
+                cov_sens=mean_cov_sens,
+                proxy_sens=mean_proxy_sens,
+                proxy_cov_ratio=mean_ratio,
+                monitor=monitor,
+            )
+
+        for epoch in range(n_epochs):
+            train_stats = _run_one_epoch(train_loader, is_train=True, epoch=epoch)
+
+            if val_loader is not None:
+                with torch.no_grad():
+                    val_stats = _run_one_epoch(val_loader, is_train=False, epoch=epoch)
+            else:
+                val_stats = dict(train_stats)
+
+            current_monitor = val_stats["monitor"] if val_loader is not None else train_stats["monitor"]
+
+            history["epoch"].append(epoch)
+            history["train_loss"].append(train_stats["loss"])
+            history["val_loss"].append(val_stats["loss"])
+            history["train_recon_loss"].append(train_stats["recon_loss"])
+            history["val_recon_loss"].append(val_stats["recon_loss"])
+            history["train_proxy_sens"].append(train_stats["proxy_sens"])
+            history["train_cov_sens"].append(train_stats["cov_sens"])
+            history["val_proxy_sens"].append(val_stats["proxy_sens"])
+            history["val_cov_sens"].append(val_stats["cov_sens"])
+            history["train_proxy_cov_ratio"].append(train_stats["proxy_cov_ratio"])
+            history["val_proxy_cov_ratio"].append(val_stats["proxy_cov_ratio"])
+            history["train_monitor"].append(train_stats["monitor"])
+            history["val_monitor"].append(val_stats["monitor"])
+            history["train_loss_proxy_floor"].append(train_stats["loss_proxy_floor"])
+            history["train_loss_ratio_floor"].append(train_stats["loss_ratio_floor"])
+            history["train_loss_latent_scale"].append(train_stats["loss_latent_scale"])
+            history["val_loss_latent_scale"].append(val_stats["loss_latent_scale"])
+            history["train_loss_latent_std"].append(train_stats["loss_latent_std"])
+            history["val_loss_latent_std"].append(val_stats["loss_latent_std"])
+            history["train_latent_rms"].append(train_stats["latent_rms"])
+            history["val_latent_rms"].append(val_stats["latent_rms"])
+
+            improved = (best_monitor - current_monitor) > min_delta
+            if improved:
+                best_monitor = current_monitor
+                best_epoch = epoch
+                bad_count = 0
+                best_state_dict = {
+                    k: v.detach().cpu().clone()
+                    for k, v in self.adapter.state_dict().items()
+                }
+            else:
+                if epoch >= min_n_epochs:
+                    bad_count += 1
+
+            if verbose and (epoch % 10 == 0):
+                logger.info(
+                    f"[stage1-pretrain] epoch={epoch:03d} "
+                    f"train_loss={train_stats['loss']:.6f} "
+                    f"train_recon={train_stats['recon_loss']:.6f} "
+                    f"train_proxy={train_stats['proxy_sens']:.4f} "
+                    f"train_cov={train_stats['cov_sens']:.4f} "
+                    f"train_ratio={train_stats['proxy_cov_ratio']:.4f} "
+                    f"train_latent_rms={train_stats['latent_rms']:.4f} | "
+                    f"train_latent_std={train_stats['loss_latent_std']:.4f} | "
+                    f"val_loss={val_stats['loss']:.6f} "
+                    f"val_recon={val_stats['recon_loss']:.6f} "
+                    f"val_proxy={val_stats['proxy_sens']:.4f} "
+                    f"val_cov={val_stats['cov_sens']:.4f} "
+                    f"val_ratio={val_stats['proxy_cov_ratio']:.4f} "
+                    f"val_latent_rms={val_stats['latent_rms']:.4f} | "
+                    f"val_latent_std={val_stats['loss_latent_std']:.4f} | "
+                    f"monitor={current_monitor:.6f} "
+                    f"best_monitor={best_monitor:.6f} "
+                    f"(best_epoch={best_epoch}) "
+                    f"bad_count={bad_count}/{patience}"
+                )
+
+            if epoch >= min_n_epochs and bad_count >= patience:
+                if verbose:
+                    logger.info(
+                        f"[stage1-pretrain] early stop at epoch={epoch}, "
+                        f"best_epoch={best_epoch}, best_monitor={best_monitor:.6f}"
+                    )
+                break
+
+        if best_state_dict is not None:
+            self.adapter.load_state_dict(best_state_dict)
             if verbose:
-                logger.info(f"[stage1-pretrain] epoch={epoch:03d} loss_past_recon={total/max(1,count):.6f}")     
-    
+                logger.info(
+                    f"[stage1-pretrain] restored best adapter weights "
+                    f"from epoch={best_epoch} (best_monitor={best_monitor:.6f})"
+                )
+        else:
+            if verbose:
+                logger.info("[stage1-pretrain] WARNING: no best_state_dict saved.")
+
+        try:
+            hist_df = pd.DataFrame(history)
+            hist_path = os.path.join(debug_dir, "pretrain_stage1_history.csv")
+            hist_df.to_csv(hist_path, index=False)
+            if verbose:
+                logger.info(f"[stage1-pretrain] saved history to: {hist_path}")
+
+            if len(hist_df) > 0:
+                plt.figure(figsize=(12, 4))
+                plt.plot(hist_df["epoch"], hist_df["train_recon_loss"], label="train_recon_loss")
+                plt.plot(hist_df["epoch"], hist_df["val_recon_loss"], label="val_recon_loss")
+                plt.plot(hist_df["epoch"], hist_df["train_monitor"], label="train_monitor")
+                plt.plot(hist_df["epoch"], hist_df["val_monitor"], label="val_monitor")
+                plt.legend()
+                plt.title("Stage1 loss / monitor")
+                plt.tight_layout()
+                plt.savefig(os.path.join(debug_dir, "pretrain_stage1_loss_monitor.png"), dpi=150)
+                plt.close()
+
+                plt.figure(figsize=(12, 4))
+                plt.plot(hist_df["epoch"], hist_df["train_proxy_sens"], label="train_proxy_sens")
+                plt.plot(hist_df["epoch"], hist_df["train_cov_sens"], label="train_cov_sens")
+                plt.plot(hist_df["epoch"], hist_df["val_proxy_sens"], label="val_proxy_sens")
+                plt.plot(hist_df["epoch"], hist_df["val_cov_sens"], label="val_cov_sens")
+                plt.legend()
+                plt.title("Stage1 sensitivity")
+                plt.tight_layout()
+                plt.savefig(os.path.join(debug_dir, "pretrain_stage1_sensitivity.png"), dpi=150)
+                plt.close()
+
+                plt.figure(figsize=(12, 4))
+                plt.plot(hist_df["epoch"], hist_df["train_proxy_cov_ratio"], label="train_proxy_cov_ratio")
+                plt.plot(hist_df["epoch"], hist_df["val_proxy_cov_ratio"], label="val_proxy_cov_ratio")
+                plt.axhline(proxy_cov_ratio_floor, linestyle="--", label="ratio_floor")
+                plt.legend()
+                plt.title("Stage1 proxy/cov ratio")
+                plt.tight_layout()
+                plt.savefig(os.path.join(debug_dir, "pretrain_stage1_ratio.png"), dpi=150)
+                plt.close()
+
+                plt.figure(figsize=(12, 4))
+                plt.plot(hist_df["epoch"], hist_df["train_latent_rms"], label="train_latent_rms")
+                plt.plot(hist_df["epoch"], hist_df["val_latent_rms"], label="val_latent_rms")
+                plt.axhline(latent_rms_target, linestyle="--", label="latent_rms_target")
+                plt.legend()
+                plt.title("Stage1 latent RMS")
+                plt.tight_layout()
+                plt.savefig(os.path.join(debug_dir, "pretrain_stage1_latent_rms.png"), dpi=150)
+                plt.close()
+        except Exception as e:
+            logger.info(f"[stage1-pretrain] save history/plots failed: {e}")
 
     def predict(
         self,

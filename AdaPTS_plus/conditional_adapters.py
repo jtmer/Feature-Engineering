@@ -421,41 +421,36 @@ class PatchStatsPredictor(nn.Module):
 #         h = self.drop(h)
 #         return x + h
     
-class NeuralTimeAdapter(nn.Module):
+class NeuralLatentEncoder(nn.Module):
     """
     - encode: (y, x) -> z
-    - decode: (z, x) -> y_hat
     """
     def __init__(
         self,
         covariates_dim: int,
         latent_dim: int,
         revin_patch_size_past: int,
-        revin_patch_size_future: int,
         hidden_dim: int = 256,
         encoder_layers: int = 2,
-        decoder_layers: int = 2,
         dropout: float = 0.0,
         normalize_latents: bool = False,
-        stats_hidden_dim: int = 128,
     ):
         super().__init__()
         self.covariates_dim = covariates_dim
         self.latent_dim = latent_dim
         self.revin_patch_size_past = revin_patch_size_past
-        self.revin_patch_size_future = revin_patch_size_future
 
         covariates_dim_aug = covariates_dim
         encoder_input_channels = 1 + covariates_dim_aug
-        decoder_input_channels = latent_dim + covariates_dim_aug
 
-        def build_temporal_decoder(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
+        def build_temporal_encoder(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
             layers = []
             ch = input_channels
             for i in range(max(1, num_layers)):
                 layers.append(nn.Conv1d(ch, hidden_dim, kernel_size=1))
                 layers.append(nn.GELU())
 
+                # layers.append(nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim))
                 layers.append(nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1))
                 layers.append(nn.GELU())
 
@@ -465,6 +460,58 @@ class NeuralTimeAdapter(nn.Module):
 
             layers.append(nn.Conv1d(ch, output_channels, kernel_size=1))
             return nn.Sequential(*layers)
+
+        # (B, 1+Cx, L) -> (B, z_dim, L)
+        self.latent_encoder = build_temporal_encoder(
+            input_channels=encoder_input_channels,
+            output_channels=latent_dim,
+            num_layers=encoder_layers,
+        )
+
+        # self.normalize_latents = normalize_latents
+        self.normalize_latents = False
+        self.latent_normalizer = (
+            nn.GroupNorm(num_groups=1, num_channels=latent_dim) if normalize_latents else nn.Identity()
+        )
+
+    def forward(self, target_series: torch.Tensor, covariates_series: torch.Tensor):
+        """
+        target_series:     (B,1,L)
+        covariates_series: (B,Cx,L)
+        returns latents:   (B,Cz,L)
+        """
+        device = next(self.parameters()).device
+        target_series = target_series.to(device)
+        covariates_series = covariates_series.to(device)
+
+        encoder_inputs = torch.cat([target_series, covariates_series], dim=1)  # (B,1+Cx,L)
+        latent_series = self.latent_encoder(encoder_inputs)                    # (B,Cz,L)
+        latent_series = self.latent_normalizer(latent_series)
+        return latent_series
+
+
+class NeuralTargetDecoder(nn.Module):
+    """
+    - decode: (z, x) -> y_hat
+    """
+    def __init__(
+        self,
+        covariates_dim: int,
+        revin_patch_size_future: int,
+        latent_dim: int,
+        hidden_dim: int = 256,
+        decoder_layers: int = 2,
+        dropout: float = 0.0,
+        normalize_latents: bool = False,
+    ):
+        super().__init__()
+        self.covariates_dim = covariates_dim
+        self.latent_dim = latent_dim
+        
+        self.revin_patch_size_future = revin_patch_size_future
+
+        covariates_dim_aug = covariates_dim
+        decoder_input_channels = latent_dim + covariates_dim_aug
 
         def build_temporal_decoder(input_channels: int, output_channels: int, num_layers: int) -> nn.Sequential:
             layers = []
@@ -485,13 +532,6 @@ class NeuralTimeAdapter(nn.Module):
             layers.append(nn.Conv1d(ch, output_channels, kernel_size=1))
             return nn.Sequential(*layers)
 
-        # (B, 1+Cx, L) -> (B, z_dim, L)
-        self.latent_encoder = build_temporal_decoder(
-            input_channels=encoder_input_channels,
-            output_channels=latent_dim,
-            num_layers=encoder_layers,
-        )
-
         # (B, z_dim+Cx, L) -> (B, 1, L)
         self.target_decoder = build_temporal_decoder(
             input_channels=decoder_input_channels,
@@ -504,30 +544,9 @@ class NeuralTimeAdapter(nn.Module):
         self.latent_normalizer = (
             nn.GroupNorm(num_groups=1, num_channels=latent_dim) if normalize_latents else nn.Identity()
         )
-        
-        self.future_stats_predictor = PatchStatsPredictor(
-            cov_dim=covariates_dim,
-            patch_size=revin_patch_size_future,
-            hidden_dim=stats_hidden_dim,
-        )
-
-    def encode(self, target_series: torch.Tensor, covariates_series: torch.Tensor):
-        """
-        target_series:     (B,1,L)
-        covariates_series: (B,Cx,L)
-        returns latents:   (B,Cz,L)
-        """
-        device = next(self.parameters()).device
-        target_series = target_series.to(device)
-        covariates_series = covariates_series.to(device)
-        
-        encoder_inputs = torch.cat([target_series, covariates_series], dim=1)  # (B,1+Cx,L)
-        latent_series = self.latent_encoder(encoder_inputs)                    # (B,Cz,L)
-        latent_series = self.latent_normalizer(latent_series)
-        return latent_series
 
     # def decode(self, latent_series: torch.Tensor, covariates_series: torch.Tensor, logstd_t: torch.Tensor):
-    def decode(self, latent_series: torch.Tensor, covariates_series: torch.Tensor):
+    def forward(self, latent_series: torch.Tensor, covariates_series: torch.Tensor):
         """
         latent_series:     (B,Cz,L)
         covariates_series: (B,Cx,L)
@@ -537,7 +556,7 @@ class NeuralTimeAdapter(nn.Module):
         latent_series = latent_series.to(device)
         covariates_series = covariates_series.to(device)
         latent_series = self.latent_normalizer(latent_series)
-        
+
         decoder_inputs = torch.cat([latent_series, covariates_series], dim=1)  # (B,Cz+Cx,L)
         target_hat = self.target_decoder(decoder_inputs)                       # (B,1,L)
         return target_hat
@@ -545,44 +564,29 @@ class NeuralTimeAdapter(nn.Module):
         # base = out[:, 0:1, :]
         # res  = torch.tanh(out[:, 1:2, :])           # [-1,1] 限幅
         # # return base, res
-        
+
         # logstd_ref = logstd_t.detach()
         # amp = 0.2 + 0.8 * torch.sigmoid(logstd_ref) # (B,1,H)，范围 [0.2,1.0]
         # target_pred_norm = base + amp * res
         # return target_pred_norm
-    
-    def predict_future_stats(self, future_covariates: torch.Tensor):
-        """
-        future_covariates: (B,Cx,H)
-        return:
-          mu_t_hat/std_t_hat: (B,1,H)
-          mu_patch_hat/std_patch_hat: (B,1,Np)
-        """
-        mu_patch_hat, std_patch_hat, logstd_patch_hat = self.future_stats_predictor(future_covariates)
-        H = future_covariates.shape[-1]
-        P = self.revin_patch_size_future
-        mu_t_hat = expand_patch_to_time(mu_patch_hat, P, H)
-        std_t_hat = expand_patch_to_time(std_patch_hat, P, H)
-        return mu_t_hat, std_t_hat, mu_patch_hat, std_patch_hat, logstd_patch_hat
-    
-    
+
 
 class NeuralEncoder(BaseEncoder):
-    def __init__(self, core: NeuralTimeAdapter):
+    def __init__(self, core: NeuralLatentEncoder):
         super().__init__()
         self.core = core
 
     def forward(self, target_series: torch.Tensor, covariates_series: torch.Tensor) -> torch.Tensor:
-        return self.core.encode(target_series, covariates_series)
+        return self.core(target_series, covariates_series)
 
 
 class NeuralDecoder(BaseDecoder):
-    def __init__(self, core: NeuralTimeAdapter):
+    def __init__(self, core: NeuralTargetDecoder):
         super().__init__()
         self.core = core
 
     def forward(self, latent_series: torch.Tensor, covariates_series: torch.Tensor) -> torch.Tensor:
-        return self.core.decode(latent_series, covariates_series)
+        return self.core(latent_series, covariates_series)
     
 class PipelineAdapter(nn.Module):
     def __init__(
@@ -666,38 +670,44 @@ def build_pipeline_adapter(
     else:
         raise ValueError(f"Unknown normalizer={normalizer}")
 
-    # Build core adapter only if needed by encoder/decoder or stats_pred for revin_patch
-    core = None
-    if (encoder_type == "neural") or (decoder_type == "neural") or (normalizer == "revin_patch"):
-        core = NeuralTimeAdapter(
+        encoder_core = None
+    decoder_core = None
+
+    if encoder_type == "neural":
+        encoder_core = NeuralLatentEncoder(
             covariates_dim=cov_dim,
             latent_dim=z_dim,
             revin_patch_size_past=patch_size,
-            revin_patch_size_future=patch_size,
             hidden_dim=256,
             encoder_layers=2,
-            decoder_layers=2,
             dropout=0.0,
-            stats_hidden_dim=128,
             normalize_latents=False,
         )
-        # if revin_patch, reuse core's predictor to keep consistent parameter group / state dict
-        if normalizer == "revin_patch":
-            stats_pred = core.future_stats_predictor
+
+    if decoder_type == "neural":
+        decoder_core = NeuralTargetDecoder(
+            covariates_dim=cov_dim,
+            latent_dim=z_dim,
+            revin_patch_size_future=patch_size,
+            hidden_dim=256,
+            decoder_layers=2,
+            dropout=0.0,
+            normalize_latents=False,
+        )
 
     if encoder_type == "none":
         enc = IdentityEncoder(latent_dim=z_dim)
     elif encoder_type == "neural":
-        assert core is not None
-        enc = NeuralEncoder(core)
+        assert encoder_core is not None
+        enc = NeuralEncoder(encoder_core)
     else:
         raise ValueError(f"Unknown encoder_type={encoder_type}")
 
     if decoder_type == "none":
         dec = IdentityDecoder(latent_dim=z_dim)
     elif decoder_type == "neural":
-        assert core is not None
-        dec = NeuralDecoder(core)
+        assert decoder_core is not None
+        dec = NeuralDecoder(decoder_core)
     else:
         raise ValueError(f"Unknown decoder_type={decoder_type}")
 

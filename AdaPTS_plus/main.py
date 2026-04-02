@@ -16,9 +16,13 @@ adapts_repo_root = "/data/mahaoke/AdaPTS"
 out_root = Path("./results_monthly_backtest")
 import sys
 sys.path.insert(0, adapts_repo_root)
+import os
+import json
+import hashlib
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 from sundial.iclearner_sundial import SundialICLTrainer
-from conditional_adapters import NeuralTimeAdapter, build_pipeline_adapter
+from conditional_adapters import build_pipeline_adapter
 from conditional_adapts import ConditionalAdaPTS
 import conditional_adapts
 
@@ -78,11 +82,25 @@ class SimpleLogger:
     def raw(self) -> logging.Logger:
         return self._logger
 
-logger = SimpleLogger(
-    "backtest",
-    log_path=str(out_root / "train.log")
-)
-conditional_adapts.logger = logger
+def _reset_logger_handlers(name: str):
+    _logger = logging.getLogger(name)
+    for h in list(_logger.handlers):
+        _logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+
+def setup_run_logger(curr_out_root: Path):
+    global logger
+    _reset_logger_handlers("backtest")
+    logger = SimpleLogger(
+        "backtest",
+        log_path=str(curr_out_root / "train.log")
+    )
+    conditional_adapts.logger = logger
+
+setup_run_logger(out_root)
 
 
 def set_seed(seed: int):
@@ -90,9 +108,76 @@ def set_seed(seed: int):
     np.random.seed(seed)
     random.seed(seed)
 
-
 def get_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    return "cuda:2" if torch.cuda.is_available() else "cpu"
+
+def _format_hp_value(v):
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, float):
+        s = f"{v:.8g}"
+        return s.replace("-", "m").replace(".", "p")
+    return str(v).replace("/", "-").replace(" ", "")
+
+
+def build_experiment_suffix(cfg: "TrainConfig", extra: Optional[Dict[str, object]] = None) -> str:
+    """
+    为实验目录生成稳定、可读、且不至于过长的后缀。
+    目录名示例：
+      ls1em4_lrt3_tlr1em4_lpr0p5_lfp2_lsp0_...
+    """
+    keys = [
+        "lambda_latent_scale",
+        "latent_rms_target",
+        "train_lr",
+        "lambda_past_recon",
+        "lambda_future_pred",
+        "lambda_stats_pred",
+        "lambda_y_patch_std",
+        "lambda_proxy_floor",
+        "proxy_sens_floor",
+        "lambda_ratio_floor",
+        "proxy_cov_ratio_floor",
+        "lambda_monitor",
+        "latent_std_floor",
+        "lambda_latent_std_floor",
+        "decoder_lr",
+        "block_future_pred_to_decoder",
+    ]
+    alias = {
+        "lambda_latent_scale": "lls",
+        "latent_rms_target": "lrt",
+        "train_lr": "tlr",
+        "lambda_past_recon": "lpr",
+        "lambda_future_pred": "lfp",
+        "lambda_stats_pred": "lsp",
+        "lambda_y_patch_std": "lyps",
+        "lambda_proxy_floor": "lpf",
+        "proxy_sens_floor": "psf",
+        "lambda_ratio_floor": "lrf",
+        "proxy_cov_ratio_floor": "pcf",
+        "lambda_monitor": "lmon",
+        "latent_std_floor": "lsf",
+        "lambda_latent_std_floor": "llsf",
+        "decoder_lr": "dlr",
+        "block_future_pred_to_decoder": "bd"
+    }
+
+    parts = []
+    for k in keys:
+        v = getattr(cfg, k)
+        parts.append(f"{alias[k]}{_format_hp_value(v)}")
+
+    if extra:
+        for k in sorted(extra.keys()):
+            parts.append(f"{k}{_format_hp_value(extra[k])}")
+
+    raw = "_".join(parts)
+    if len(raw) <= 160:
+        return raw
+
+    short_hash = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+    return raw[:140] + "_h" + short_hash
 
 
 def print_basic_stats(name: str, x: np.ndarray):
@@ -189,76 +274,75 @@ def make_time_windows(
 
     return np.stack(ts_p), np.stack(ts_f)
 
-def make_daily_anchored_test_windows(
+def make_daily_anchored_month_windows(
     df: pd.DataFrame,
     *,
     time_col: str,
     target_col: str,
     cov_cols: List[str],
-    drop_cols: List[str],
-    month_start: pd.Timestamp,     # e.g. 2024-08-01
-    month_end: pd.Timestamp,       # e.g. 2024-09-01 (exclusive)
+    month_start: pd.Timestamp,     # 这个月的开始，如 2024-07-01
+    month_end: pd.Timestamp,       # 这个月的结束(开区间)，如 2024-08-01
     hist_window: int,              # L
-    pred_window: int,              # H (96)
+    pred_window: int,              # H
     scaler_X: StandardScaler,
     scaler_y: StandardScaler,
-    freq: int = 15,             # 15分钟一个点
+    freq: int = 15,                # 15分钟一个点
     target_hour: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    对测试月内每一天做 0 点起报的日预测窗口：
-      输入：该日 0 点之前 hist_window 点 (past)
-      预测：该日 0 点起 pred_window 点 (future)
+    对 month_start ~ month_end 这个自然月内的每一天做 0 点起报窗口：
 
-    返回:
-      y_p_te: (B,1,L)
-      x_p_te: (B,Cx,L)
-      x_f_te: (B,Cx,H)
-      y_f_te: (B,1,H)
-      t_f_te: (B,H)  用于 workday/anchor 筛选与指标
+      对月内每个 anchor day:
+        输入  = 该日 0 点之前 hist_window 个点
+        预测  = 该日 0 点起 pred_window 个点
+
+    注意：
+    - past 可以跨月，但必须严格在 anchor 之前
+    - 只为 month_start ~ month_end 内的 anchor 生成样本
+    - 这正适用于 val / test
     """
     dff = df[[time_col, target_col] + cov_cols].copy()
     dff = dff.sort_values(time_col).reset_index(drop=True)
-
-    # 用时间做索引，便于按 timestamp 切片
     dff = dff.set_index(time_col)
 
-    # 测试月内每天的起报锚点（自然日 00:00）
-    anchors = pd.date_range(start=month_start, end=month_end, freq="D", inclusive="left")
+    anchors = pd.date_range(
+        start=month_start,
+        end=month_end,
+        freq="D",
+        inclusive="left",
+    )
     anchors = [a for a in anchors if a.hour == target_hour]
 
     ys_p, xs_p, xs_f, ys_f, ts_f = [], [], [], [], []
 
-    for a in anchors:
-        # future: [a, a+H)
-        fut = dff.loc[a: a + pd.Timedelta(minutes=freq * (pred_window - 1))]
+    future_span = pd.Timedelta(minutes=freq * (pred_window - 1))
 
+    for a in anchors:
+        # future: [a, a + pred_window)
+        fut = dff.loc[a: a + future_span]
         if len(fut) != pred_window:
             continue
 
-        # past: 取锚点之前 hist_window 个点
-        past = dff.loc[:a].iloc[:-1]  # strictly before a
+        # past: strictly before a
+        past = dff.loc[:a].iloc[:-1]
         if len(past) < hist_window:
             continue
         past = past.iloc[-hist_window:]
 
-        # --- 转成 raw arrays ---
-        X_p_raw = past[cov_cols].to_numpy(np.float32)          # (L,Cx)
-        y_p_raw = past[target_col].to_numpy(np.float32)        # (L,)
-        X_f_raw = fut[cov_cols].to_numpy(np.float32)           # (H,Cx)
-        y_f_raw = fut[target_col].to_numpy(np.float32)         # (H,)
-        t_f_raw = fut.index.to_numpy()                         # (H,)
+        X_p_raw = past[cov_cols].to_numpy(np.float32)     # (L, Cx)
+        y_p_raw = past[target_col].to_numpy(np.float32)   # (L,)
+        X_f_raw = fut[cov_cols].to_numpy(np.float32)      # (H, Cx)
+        y_f_raw = fut[target_col].to_numpy(np.float32)    # (H,)
+        t_f_raw = fut.index.to_numpy()                    # (H,)
 
-        # --- scale ---
         X_p_s, y_p_s = scale_xy(X_p_raw, y_p_raw, scaler_X, scaler_y)
         X_f_s, y_f_s = scale_xy(X_f_raw, y_f_raw, scaler_X, scaler_y)
 
-        # --- reshape to model format ---
-        xs_p.append(X_p_s.T)                 # (Cx,L)
-        ys_p.append(y_p_s[None, :])          # (1,L)
-        xs_f.append(X_f_s.T)                 # (Cx,H)
-        ys_f.append(y_f_s[None, :])          # (1,H)
-        ts_f.append(t_f_raw)                 # (H,)
+        xs_p.append(X_p_s.T)        # (Cx, L)
+        ys_p.append(y_p_s[None, :]) # (1, L)
+        xs_f.append(X_f_s.T)        # (Cx, H)
+        ys_f.append(y_f_s[None, :]) # (1, H)
+        ts_f.append(t_f_raw)        # (H,)
 
     if len(ys_p) == 0:
         cov_dim = len(cov_cols)
@@ -494,13 +578,26 @@ class TrainConfig:
     stats_pretrain_bs: int = 64
     stats_pretrain_lr: float = 1e-4
     stats_pretrain_wd: float = 1e-4
-    stats_pretrain_patience: int = 8
+    stats_pretrain_patience: int = 15
 
     # past recon pretrain
-    past_pretrain_epochs: int = 20
+    past_pretrain_epochs: int = 200
+    past_pretrain_min_epochs: int = 60
     past_pretrain_bs: int = 32
     past_pretrain_lr: float = 1e-4
     past_pretrain_wd: float = 1e-4
+    past_pretrain_patience: int = 15
+
+    lambda_latent_scale: float = 1e-4
+    latent_rms_target: float = 3.0
+
+    lambda_proxy_floor: float = 2.0
+    proxy_sens_floor: float = 0.40
+    lambda_ratio_floor: float = 1.0
+    proxy_cov_ratio_floor: float = 0.50
+    lambda_monitor: float = 1.0
+    latent_std_floor: float = 0.3
+    lambda_latent_std_floor: float = 0.0
 
     # adapter train
     train_epochs: int = 60
@@ -513,14 +610,24 @@ class TrainConfig:
     lambda_stats_pred: float = 0.0
     lambda_y_patch_std: float = 0.5
 
+    freeze_decoder: bool = True
+    block_future_pred_to_decoder: bool = False
+    encoder_lr: float = 1e-4
+    decoder_lr: float = 1e-4
+    stats_lr: float = 1e-4
+
     ltm_batch_size_train: int = 1
     ltm_batch_size_pred: int = 32
 
     # predict sampling
-    n_samples: int = 30
-
+    n_samples: int = 8
     # vis
     max_vis_windows: int = 6  # 每个月最多画几条
+    
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
 
 
 # =========================
@@ -558,33 +665,106 @@ def get_test_with_lookahead_points(
     d_test_ext = pd.concat([d_month, d_more], axis=0)
     return d_test_ext, test_end_raw
 
+# def split_train_test_by_month(
+#     df: pd.DataFrame,
+#     time_col: str,
+#     test_month_start: pd.Timestamp,
+#     train_years: int = 2,
+#     test_months: int = 1,
+#     train_ratio: float = 0.7,   # train/val 比例
+# ) -> Dict[str, pd.DataFrame]:
+#     """
+#     Train_all: [test_start - train_years, test_start)
+#     Test     : [test_start, test_start + test_months)
+
+#     在 Train_all 内部按时间顺序切：
+#       Train = 前 train_ratio
+#       Val   = 后 (1-train_ratio)
+#     """
+#     assert 0.0 < train_ratio < 1.0, "train_ratio must be in (0,1)"
+
+#     test_start = test_month_start
+#     test_end = test_start + pd.DateOffset(months=test_months)
+#     train_start = test_start - pd.DateOffset(years=train_years)
+#     train_end = test_start
+
+#     d_train_all = df[(df[time_col] >= train_start) & (df[time_col] < train_end)].copy()
+#     d_test = df[(df[time_col] >= test_start) & (df[time_col] < test_end)].copy()
+
+#     # 过去两年不足时，直接返回空
+#     if len(d_train_all) < 2:
+#         return dict(
+#             train=d_train_all.iloc[:0].copy(),
+#             val=d_train_all.iloc[:0].copy(),
+#             train_all=d_train_all,
+#             test=d_test,
+#             train_start=train_start,
+#             train_end=train_end,
+#             test_start=test_start,
+#             test_end=test_end,
+#             val_start=None,
+#             val_end=None,
+#         )
+
+#     # 按时间顺序切分
+#     d_train_all = d_train_all.sort_values(time_col).reset_index(drop=True)
+#     n_all = len(d_train_all)
+#     n_train = int(np.floor(n_all * train_ratio))
+#     n_train = max(1, min(n_train, n_all - 1))  # 至少给 val 留 1 条
+
+#     d_train = d_train_all.iloc[:n_train].copy()
+#     d_val   = d_train_all.iloc[n_train:].copy()
+
+#     val_start = d_val[time_col].iloc[0]
+#     val_end   = d_val[time_col].iloc[-1]
+
+#     return dict(
+#         train=d_train,
+#         val=d_val,
+#         train_all=d_train_all,
+#         test=d_test,
+#         train_start=train_start,
+#         train_end=train_end,
+#         test_start=test_start,
+#         test_end=test_end,
+#         val_start=val_start,
+#         val_end=val_end,
+#     )
+
 def split_train_test_by_month(
     df: pd.DataFrame,
     time_col: str,
     test_month_start: pd.Timestamp,
     train_years: int = 2,
     test_months: int = 1,
-    train_ratio: float = 0.7,   # train/val 比例
+    val_months: int = 1,   # 固定最后一个完整月份做验证
 ) -> Dict[str, pd.DataFrame]:
     """
     Train_all: [test_start - train_years, test_start)
     Test     : [test_start, test_start + test_months)
 
-    在 Train_all 内部按时间顺序切：
-      Train = 前 train_ratio
-      Val   = 后 (1-train_ratio)
-    """
-    assert 0.0 < train_ratio < 1.0, "train_ratio must be in (0,1)"
+    现在改为：
+      Val   = Train_all 中最后完整的 val_months 个月
+      Train = Train_all 中除去最后 val_months 个月的更早部分
 
-    test_start = test_month_start
+    即：
+      train 与 val 不重合
+      val 按完整自然月截取
+    """
+    assert val_months >= 1, "val_months must be >= 1"
+
+    test_start = pd.Timestamp(test_month_start)
     test_end = test_start + pd.DateOffset(months=test_months)
+
     train_start = test_start - pd.DateOffset(years=train_years)
     train_end = test_start
+
+    val_start = test_start - pd.DateOffset(months=val_months)
+    val_end = test_start
 
     d_train_all = df[(df[time_col] >= train_start) & (df[time_col] < train_end)].copy()
     d_test = df[(df[time_col] >= test_start) & (df[time_col] < test_end)].copy()
 
-    # 过去两年不足时，直接返回空
     if len(d_train_all) < 2:
         return dict(
             train=d_train_all.iloc[:0].copy(),
@@ -599,17 +779,20 @@ def split_train_test_by_month(
             val_end=None,
         )
 
-    # 按时间顺序切分
     d_train_all = d_train_all.sort_values(time_col).reset_index(drop=True)
-    n_all = len(d_train_all)
-    n_train = int(np.floor(n_all * train_ratio))
-    n_train = max(1, min(n_train, n_all - 1))  # 至少给 val 留 1 条
 
-    d_train = d_train_all.iloc[:n_train].copy()
-    d_val   = d_train_all.iloc[n_train:].copy()
+    # 验证集：最后一个完整月（或最后 val_months 个完整月）
+    d_val = d_train_all[
+        (d_train_all[time_col] >= val_start) & (d_train_all[time_col] < val_end)
+    ].copy()
 
-    val_start = d_val[time_col].iloc[0]
-    val_end   = d_val[time_col].iloc[-1]
+    # 训练集：验证集之前的所有数据
+    d_train = d_train_all[
+        (d_train_all[time_col] >= train_start) & (d_train_all[time_col] < val_start)
+    ].copy()
+
+    val_start_out = val_start if len(d_val) > 0 else None
+    val_end_out = (val_end - pd.Timedelta(microseconds=1)) if len(d_val) > 0 else None
 
     return dict(
         train=d_train,
@@ -620,8 +803,8 @@ def split_train_test_by_month(
         train_end=train_end,
         test_start=test_start,
         test_end=test_end,
-        val_start=val_start,
-        val_end=val_end,
+        val_start=val_start_out,
+        val_end=val_end_out,
     )
 
 
@@ -868,7 +1051,7 @@ def predict_and_metrics_one_month(
     safe_hist(ax, iMAPEs, bins=20, label="iMAPE (%)")
     safe_hist(ax, iMAPE_ads, bins=20, label="iMAPE-ad (%)")
     ax.set_title(f"Error distribution (used days) | patch={patch_size} | z_dim={z_dim}")
-    ax.legend()
+    ax  .legend()
     fig.tight_layout()
     fig.savefig(vis_dir / "error_hist.png", dpi=150)
     plt.close(fig)
@@ -913,7 +1096,8 @@ def build_parser():
     p.add_argument("--start_ym", type=str, default="2024-08")
     p.add_argument("--end_ym", type=str, default="2025-07")
     p.add_argument("--train_years", type=int, default=2)
-    p.add_argument("--train_ratio", type=float, default=0.7)
+    # p.add_argument("--train_ratio", type=float, default=0.7)
+    p.add_argument("--val_months", type=int, default=1)
     p.add_argument("--target_hour", type=int, default=0)
     p.add_argument("--freq_min", type=int, default=15)
 
@@ -934,41 +1118,67 @@ def build_parser():
     p.add_argument("--normalizer", type=str, default="identity", choices=["identity", "revin_patch"])
 
     # train
-    p.add_argument("--stats_pretrain_epochs", type=int, default=80)
+    p.add_argument("--stats_pretrain_epochs", type=int, default=100)
     p.add_argument("--stats_pretrain_bs", type=int, default=64)
     p.add_argument("--stats_pretrain_lr", type=float, default=1e-4)
     p.add_argument("--stats_pretrain_wd", type=float, default=1e-4)
     p.add_argument("--stats_pretrain_patience", type=int, default=8)
 
-    p.add_argument("--past_pretrain_epochs", type=int, default=20)
+    p.add_argument("--past_pretrain_epochs", type=int, default=200)
+    p.add_argument("--past_pretrain_min_epochs", type=int, default=60)
     p.add_argument("--past_pretrain_bs", type=int, default=32)
-    p.add_argument("--past_pretrain_lr", type=float, default=1e-4)
+    p.add_argument("--past_pretrain_lr", type=float, default=5e-4)
     p.add_argument("--past_pretrain_wd", type=float, default=1e-4)
+    p.add_argument("--past_pretrain_patience", type=int, default=15)
+
+    p.add_argument("--lambda_latent_scale", type=float, default=1e-4)
+    p.add_argument("--latent_rms_target", type=float, default=15.0)
+
+    p.add_argument("--lambda_proxy_floor", type=float, default=2.0)
+    p.add_argument("--proxy_sens_floor", type=float, default=0.40)
+    p.add_argument("--lambda_ratio_floor", type=float, default=1.0)
+    p.add_argument("--proxy_cov_ratio_floor", type=float, default=0.50)
+    p.add_argument("--lambda_monitor", type=float, default=1.0)
+    p.add_argument("--latent_std_floor", type=float, default=0.3)
+    p.add_argument("--lambda_latent_std_floor", type=float, default=0.0)
 
     p.add_argument("--train_epochs", type=int, default=60)
     p.add_argument("--train_bs", type=int, default=32)
-    p.add_argument("--train_lr", type=float, default=1e-4)
+    p.add_argument("--train_lr", type=float, default=5e-5)
     p.add_argument("--train_wd", type=float, default=1e-4)
-
     p.add_argument("--lambda_past_recon", type=float, default=0.5)
     p.add_argument("--lambda_future_pred", type=float, default=2.0)
     p.add_argument("--lambda_latent_stats", type=float, default=0.5)
     p.add_argument("--lambda_stats_pred", type=float, default=0.0)
     p.add_argument("--lambda_y_patch_std", type=float, default=0.5)
 
+    p.add_argument("--freeze_decoder", type=int, default=0)
+    p.add_argument("--block_future_pred_to_decoder", type=int, default=0)
+    p.add_argument("--encoder_lr", type=float, default=1e-4)
+    p.add_argument("--decoder_lr", type=float, default=1e-4)
+    p.add_argument("--stats_lr", type=float, default=1e-4)
+
     p.add_argument("--ltm_batch_size_train", type=int, default=1)
     p.add_argument("--ltm_batch_size_pred", type=int, default=32)
-
-    # predict / vis
     p.add_argument("--n_samples", type=int, default=30)
     p.add_argument("--max_vis_windows", type=int, default=6)
 
+    # experiment naming / batch
+    p.add_argument("--exp_suffix", type=str, default="")
+    p.add_argument("--auto_out_root", type=int, default=1)
+
     # debug
-    p.add_argument("--debug", action="store_true")
+    p.add_argument("--debug", type=int, default=1)
     p.add_argument("--debug_every", type=int, default=2)
     p.add_argument("--debug_num_seq", type=int, default=2)
     p.add_argument("--debug_latent_ch", type=int, default=1)
     p.add_argument("--earlystop_patience", type=int, default=10)
+    
+    # dataloader
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--pin_memory", type=int, default=1)
+    p.add_argument("--persistent_workers", type=int, default=1)
+    p.add_argument("--prefetch_factor", type=int, default=2)
 
     return p
 
@@ -979,11 +1189,20 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    
+    global out_root
+    freeze_decoder_bool = bool(args.freeze_decoder)
+    block_future_pred_to_decoder_bool = bool(args.block_future_pred_to_decoder)
+    
 
     # ---- seed & device ----
     device = get_device()
     set_seed(args.seed)
     logger.info("device:", device)
+    if torch.cuda.is_available():
+        logger.info("torch.cuda.current_device():", torch.cuda.current_device())
+        logger.info("torch.cuda.device_count():", torch.cuda.device_count())
+        logger.info("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES", None))
     
     # ---- configs ----
     wcfg = WindowConfig(
@@ -1006,9 +1225,20 @@ def main():
         stats_pretrain_wd=args.stats_pretrain_wd,
         stats_pretrain_patience=args.stats_pretrain_patience,
         past_pretrain_epochs=args.past_pretrain_epochs,
+        past_pretrain_min_epochs=args.past_pretrain_min_epochs,
         past_pretrain_bs=args.past_pretrain_bs,
         past_pretrain_lr=args.past_pretrain_lr,
         past_pretrain_wd=args.past_pretrain_wd,
+        past_pretrain_patience=args.past_pretrain_patience,
+        lambda_latent_scale=args.lambda_latent_scale,
+        latent_rms_target=args.latent_rms_target,
+        lambda_proxy_floor=args.lambda_proxy_floor,
+        proxy_sens_floor=args.proxy_sens_floor,
+        lambda_ratio_floor=args.lambda_ratio_floor,
+        proxy_cov_ratio_floor=args.proxy_cov_ratio_floor,
+        lambda_monitor=args.lambda_monitor,
+        latent_std_floor=args.latent_std_floor,
+        lambda_latent_std_floor=args.lambda_latent_std_floor,
         train_epochs=args.train_epochs,
         train_bs=args.train_bs,
         train_lr=args.train_lr,
@@ -1018,21 +1248,50 @@ def main():
         lambda_latent_stats=args.lambda_latent_stats,
         lambda_stats_pred=args.lambda_stats_pred,
         lambda_y_patch_std=args.lambda_y_patch_std,
+        freeze_decoder=freeze_decoder_bool,
+        block_future_pred_to_decoder=block_future_pred_to_decoder_bool,
+        encoder_lr=args.encoder_lr,
+        decoder_lr=args.decoder_lr,
+        stats_lr=args.stats_lr,
         ltm_batch_size_train=args.ltm_batch_size_train,
         ltm_batch_size_pred=args.ltm_batch_size_pred,
         n_samples=args.n_samples,
         max_vis_windows=args.max_vis_windows,
+        num_workers=args.num_workers,
+        pin_memory=bool(args.pin_memory),
+        persistent_workers=bool(args.persistent_workers),
+        prefetch_factor=args.prefetch_factor,
     )
+
+    if args.auto_out_root:
+        suffix = args.exp_suffix.strip() if args.exp_suffix.strip() else build_experiment_suffix(cfg)
+        out_root = Path(f"{args.out_root}__{suffix}")
+    else:
+        out_root = Path(args.out_root)
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    setup_run_logger(out_root)
 
     logger.info("[config] window:", asdict(wcfg))
     logger.info("[config] train :", asdict(cfg))
     logger.info("[config] misc  :", dict(
         start_ym=args.start_ym, end_ym=args.end_ym,
-        train_years=args.train_years, train_ratio=args.train_ratio,
+        train_years=args.train_years, val_months=args.val_months,
         target_hour=args.target_hour, freq_min=args.freq_min,
         debug=args.debug, debug_every=args.debug_every,
         earlystop_patience=args.earlystop_patience,
     ))
+    with open(out_root / "run_config.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "window_config": asdict(wcfg),
+                "train_config": asdict(cfg),
+                "args": vars(args),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # ---- load data ----
     df = load_dataset(args.data_path, time_col=args.time_col)
@@ -1057,7 +1316,7 @@ def main():
             test_month_start=m0,
             train_years=args.train_years,
             test_months=1,
-            train_ratio=args.train_ratio,
+            val_months=args.val_months,
         )
 
         d_train = split["train"]
@@ -1069,8 +1328,17 @@ def main():
 
         logger.info("\n====================================================")
         logger.info(f"[Backtest month] {month_tag}")
-        logger.info(f"train: {split['train_start'].date()} -> {split['val_start'].date()}  (len={len(d_train)})")
-        logger.info(f"val  : {split['val_start'].date()} -> {split['val_end'].date()}    (len={len(d_val)})")
+
+        if len(d_train) > 0:
+            logger.info(f"train: {d_train[args.time_col].min().date()} -> {d_train[args.time_col].max().date()}  (len={len(d_train)})")
+        else:
+            logger.info(f"train: empty (len={len(d_train)})")
+
+        if split["val_start"] is not None and split["val_end"] is not None:
+            logger.info(f"val(last {args.val_months} full month): {split['val_start'].date()} -> {split['val_end'].date()}  (len={len(d_val)})")
+        else:
+            logger.info(f"val(last {args.val_months} full month): empty (len={len(d_val)})")
+
         logger.info(f"test(daily anchors): {test_start.date()} -> {test_end.date()}")
 
         if len(d_train) < (wcfg.hist_window + wcfg.pred_window):
@@ -1088,17 +1356,40 @@ def main():
         scaler_X, scaler_y = fit_scalers(X_tr_raw, y_tr_raw)
 
         X_tr_s, y_tr_s = scale_xy(X_tr_raw, y_tr_raw, scaler_X, scaler_y)
-        X_va_s, y_va_s = scale_xy(X_va_raw, y_va_raw, scaler_X, scaler_y)
 
-        y_p_tr, x_p_tr, x_f_tr, y_f_tr = make_windows(X_tr_s, y_tr_s, wcfg.hist_window, wcfg.pred_window, wcfg.stride_train)
-        y_p_va, x_p_va, x_f_va, y_f_va = make_windows(X_va_s, y_va_s, wcfg.hist_window, wcfg.pred_window, wcfg.stride_eval)
+        # 训练集：仍然只在 d_train 内部切窗
+        # 这样就天然满足“训练集第一个月不能访问 train_start 之前的数据”
+        y_p_tr, x_p_tr, x_f_tr, y_f_tr = make_windows(
+            X_tr_s, y_tr_s,
+            wcfg.hist_window, wcfg.pred_window,
+            wcfg.stride_train
+        )
 
-        y_p_te, x_p_te, x_f_te, y_f_te, t_f_te = make_daily_anchored_test_windows(
+        # ===== 验证集：按“验证月内每天”做 anchor =====
+        val_month_start = test_start - pd.DateOffset(months=args.val_months)
+        val_month_end = test_start
+
+        y_p_va, x_p_va, x_f_va, y_f_va, t_f_va = make_daily_anchored_month_windows(
             df=df,
             time_col=args.time_col,
             target_col=args.target_col,
             cov_cols=cov_cols,
-            drop_cols=drop_cols,
+            month_start=val_month_start,
+            month_end=val_month_end,
+            hist_window=wcfg.hist_window,
+            pred_window=wcfg.pred_window,
+            scaler_X=scaler_X,
+            scaler_y=scaler_y,
+            freq=args.freq_min,
+            target_hour=args.target_hour,
+        )
+
+        # ===== 测试集：按“测试月内每天”做 anchor =====
+        y_p_te, x_p_te, x_f_te, y_f_te, t_f_te = make_daily_anchored_month_windows(
+            df=df,
+            time_col=args.time_col,
+            target_col=args.target_col,
+            cov_cols=cov_cols,
             month_start=test_start,
             month_end=test_end,
             hist_window=wcfg.hist_window,
@@ -1109,7 +1400,11 @@ def main():
             target_hour=args.target_hour,
         )
 
-        logger.info(f"[windows] train={y_p_tr.shape[0]}  val={y_p_va.shape[0]}  test(daily)={y_p_te.shape[0]}")
+        logger.info(
+            f"[windows] train={y_p_tr.shape[0]}  "
+            f"val(daily)={y_p_va.shape[0]}  "
+            f"test(daily)={y_p_te.shape[0]}"
+        )
 
         if y_p_tr.shape[0] == 0:
             logger.info(f"[skip] Train windows empty in month {month_tag}")
@@ -1147,6 +1442,10 @@ def main():
             future_target=y_f_va,
             future_covariates=x_f_va,
         )
+        past_val_data = dict(
+            past_target=y_p_va,
+            past_covariates=x_p_va,
+        )
 
         # ---- pretrain stats predictor ONLY if enabled by pipeline ----
         if model2.adapter.has_stats_predictor:
@@ -1173,14 +1472,32 @@ def main():
             model2.pretrain_past_reconstruction_only(
                 past_target=y_p_tr,
                 past_covariates=x_p_tr,
+                val_data=past_val_data,
                 n_epochs=cfg.past_pretrain_epochs,
+                min_n_epochs=cfg.past_pretrain_min_epochs,
                 batch_size=cfg.past_pretrain_bs,
                 lr=cfg.past_pretrain_lr,
                 weight_decay=cfg.past_pretrain_wd,
+                patience=cfg.past_pretrain_patience,
+                lambda_proxy_floor=cfg.lambda_proxy_floor,
+                proxy_sens_floor=cfg.proxy_sens_floor,
+                lambda_ratio_floor=cfg.lambda_ratio_floor,
+                proxy_cov_ratio_floor=cfg.proxy_cov_ratio_floor,
+                lambda_monitor=cfg.lambda_monitor,
+                lambda_latent_scale=cfg.lambda_latent_scale,
+                latent_rms_target=cfg.latent_rms_target,
+                latent_std_floor=cfg.latent_std_floor,
+                lambda_latent_std_floor=cfg.lambda_latent_std_floor,
                 debug=True,
                 debug_dir=str(out_root / f"debug_no_revin_residual_{month_tag}"),
-                debug_plot=True,
+                # debug_plot=True,
+                debug_plot=False,
                 verbose=True,
+                
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                persistent_workers=cfg.persistent_workers,
+                prefetch_factor=cfg.prefetch_factor,
             )
             logger.info(">>> Done pretraining past reconstruction.")
         else:
@@ -1213,6 +1530,16 @@ def main():
                 debug_num_seq=args.debug_num_seq,
                 debug_latent_ch=args.debug_latent_ch,
                 earlystop_patience=args.earlystop_patience,
+                freeze_decoder=cfg.freeze_decoder,
+                block_future_pred_to_decoder=cfg.block_future_pred_to_decoder,
+                encoder_lr=cfg.encoder_lr,
+                decoder_lr=cfg.decoder_lr,
+                stats_lr=cfg.stats_lr,
+                
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                persistent_workers=cfg.persistent_workers,
+                prefetch_factor=cfg.prefetch_factor,
             )
             logger.info(">>> Done training adapter.")
         else:
