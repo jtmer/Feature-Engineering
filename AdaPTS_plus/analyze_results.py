@@ -14,8 +14,10 @@ import matplotlib.pyplot as plt
 # Config
 # ============================================================
 
-DEFAULT_ROOT = "."
+# DEFAULT_ROOT = "."
+DEFAULT_ROOT = "/share/workspace/mahaoke"
 DEFAULT_GLOB = "results/results_monthly_backtest_*"
+DEFAULT_OUTPUT = "analysis_results_batch3"
 
 # 目录名中参数别名 -> 完整名
 HP_ALIAS_TO_NAME = {
@@ -34,6 +36,8 @@ HP_ALIAS_TO_NAME = {
     "lsf": "latent_std_floor",
     "llsf": "lambda_latent_std_floor",
     "dlr": "decoder_lr",
+    "bd": "block_future_pred_to_decoder",
+    # "crs": "covariate_residual_scale",
 }
 
 HP_NAME_ORDER = [
@@ -52,6 +56,8 @@ HP_NAME_ORDER = [
     "latent_std_floor",
     "lambda_latent_std_floor",
     "decoder_lr",
+    "block_future_pred_to_decoder",
+    # "covariate_residual_scale",
 ]
 
 MAIN_METRICS = ["iMAE", "iMSE"]
@@ -739,7 +745,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default=DEFAULT_ROOT)
     parser.add_argument("--glob", type=str, default=DEFAULT_GLOB)
-    parser.add_argument("--out_dir", type=str, default="analysis_results")
+    parser.add_argument("--out_dir", type=str, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
     root = Path(args.root)

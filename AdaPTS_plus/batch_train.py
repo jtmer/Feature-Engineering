@@ -25,16 +25,17 @@ GPU_IDS = list(range(8))
 POLL_INTERVAL = 30
 
 # 判定“空闲卡”的阈值
-MAX_USED_MEM_MB = 1500
+MAX_USED_MEM_MB = 3000
 MIN_FREE_UTIL = 10  # util.gpu <= 10 认为够空闲
 
 # 并发上限（通常 <= 8）
 MAX_CONCURRENT_JOBS = 8
 
-# 基础命令参数：这里放你不打算 sweep 的固定参数
+# 基础命令参数
 BASE_ARGS = {
     "--data_path": "/data/Xiexin/EPF/shanxi_spot_trading_data-predValue.csv",
-    "--out_root": "./results/results_monthly_backtest",
+    "--out_root": "./results3/results_monthly_backtest",
+    # "--out_root": "/share/workspace/mahaoke/results/results_monthly_backtest",
     "--time_col": "time",
     "--target_col": "day_ahead_clearing_price",
     "--drop_cols": "time,realtime_clearing_price",
@@ -49,7 +50,7 @@ BASE_ARGS = {
     "--stride_train": 96,
     "--stride_eval": 96,
     "--seed": 13,
-    "--model_name": "thuml/sundial-base-128m",
+    "--model_name": "/data/mahaoke/Feature-Engineering/AdaPTS_plus/sundial",
     "--z_dim": 1,
     "--patch_size": 16,
     "--encoder_type": "neural",
@@ -69,7 +70,7 @@ BASE_ARGS = {
     "--train_epochs": 60,
     "--train_bs": 32,
     "--train_wd": 1e-4,
-    "--lambda_latent_stats": 0.5,
+    "--lambda_latent_stats": 0.1,
     "--ltm_batch_size_train": 1,
     "--ltm_batch_size_pred": 32,
     "--n_samples": 30,
@@ -83,10 +84,11 @@ BASE_ARGS = {
     "--debug_latent_ch": 1,
     "--earlystop_patience": 10,
     "--auto_out_root": 1,
-    "--num_workers": 2,
+    "--num_workers": 4,
     "--pin_memory": 1,
     "--persistent_workers": 1,
     "--prefetch_factor": 2,
+    # "--block_future_pred_to_decoder": 0
 }
 
 # =========================
@@ -97,14 +99,32 @@ BASE_ARGS = {
 # lambda_past_recon、lambda_future_pred、lambda_stats_pred、lambda_y_patch_std、
 # lambda_proxy_floor、proxy_sens_floor、lambda_ratio_floor、proxy_cov_ratio_floor、lambda_monitor、latent_std_floor、lambda_latent_std_floor、
 # decoder_lr
+# SEARCH_SPACE = {
+#     "--lambda_latent_scale": [1e-4, 0],
+#     "--latent_rms_target": [10.0, 25.0],
+#     "--train_lr": [1e-4],
+#     "--lambda_past_recon": [0.5, 1.0],
+#     "--lambda_future_pred": [2.0, 4.0],
+#     "--lambda_stats_pred": [0.0, 0.2],
+#     "--lambda_y_patch_std": [0.5, 1.0],
+#     "--lambda_proxy_floor": [2.0],
+#     "--proxy_sens_floor": [0.40],
+#     "--lambda_ratio_floor": [1.0],
+#     "--proxy_cov_ratio_floor": [0.40],
+#     "--lambda_monitor": [1.0],
+#     "--latent_std_floor": [0.3],
+#     "--lambda_latent_std_floor": [0.0],
+#     "--decoder_lr": [1e-4, 5e-5, 1e-5],
+#     "--block_future_pred_to_decoder": [0, 1]
+# }
 SEARCH_SPACE = {
-    "--lambda_latent_scale": [1e-4, 0],
-    "--latent_rms_target": [10.0, 25.0],
-    "--train_lr": [5e-5],
-    "--lambda_past_recon": [0.5, 1.0],
-    "--lambda_future_pred": [2.0, 4.0],
-    "--lambda_stats_pred": [0.0, 0.2],
-    "--lambda_y_patch_std": [0.5, 1.0],
+    "--lambda_latent_scale": [3e-4],
+    "--latent_rms_target": [12.0],
+    "--train_lr": [1e-4],
+    "--lambda_past_recon": [1.0],
+    "--lambda_future_pred": [2.0],
+    "--lambda_stats_pred": [0.0],
+    "--lambda_y_patch_std": [1.0],
     "--lambda_proxy_floor": [2.0],
     "--proxy_sens_floor": [0.40],
     "--lambda_ratio_floor": [1.0],
@@ -112,7 +132,9 @@ SEARCH_SPACE = {
     "--lambda_monitor": [1.0],
     "--latent_std_floor": [0.3],
     "--lambda_latent_std_floor": [0.0],
-    "--decoder_lr": [1e-4, 5e-5, 1e-5],
+    "--decoder_lr": [1e-5, 3e-5],
+    "--block_future_pred_to_decoder": [0, 1],
+    # "--covariate_residual_scale": [0.3, 0.5, 0.8]
 }
 
 
@@ -141,6 +163,8 @@ def build_exp_suffix(cfg: Dict[str, Any]) -> str:
         "--latent_std_floor": "lsf",
         "--lambda_latent_std_floor": "llsf",
         "--decoder_lr": "dlr",
+        "--block_future_pred_to_decoder": "bd",
+        # "--covariate_residual_scale": "crs",
     }
     parts = []
     for k in SEARCH_SPACE.keys():
@@ -211,7 +235,7 @@ def launch_job(job_cfg: Dict[str, Any], gpu_id: int, work_dir: str = ".") -> sub
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     exp_suffix = job_cfg["--exp_suffix"]
-    launcher_dir = Path(job_cfg["--out_root"] + "_" + exp_suffix)
+    launcher_dir = Path(job_cfg["--out_root"] + "__" + exp_suffix)
     launcher_dir.mkdir(parents=True, exist_ok=True)
 
     with open(launcher_dir / "launcher_job_config.json", "w", encoding="utf-8") as f:
@@ -228,13 +252,14 @@ def launch_job(job_cfg: Dict[str, Any], gpu_id: int, work_dir: str = ".") -> sub
         cmd,
         cwd=work_dir,
         env=env,
-        stdout=stdout_f,
+        # stdout=stdout_f,
+        stdout=subprocess.DEVNULL,
         stderr=stderr_f,
         preexec_fn=os.setsid,
     )
-    p._stdout_f = stdout_f
+    # p._stdout_f = stdout_f
     p._stderr_f = stderr_f
-    p._stdout_path = str(launcher_dir / "launcher_stdout.log")
+    # p._stdout_path = str(launcher_dir / "launcher_stdout.log")
     p._stderr_path = str(launcher_dir / "launcher_stderr.log")
     p._gpu_id = gpu_id
     p._exp_suffix = exp_suffix

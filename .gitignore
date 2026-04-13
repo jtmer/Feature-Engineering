@@ -17,8 +17,8 @@ debug_no_revin_residual/
 debug_train_adapter/
 results_monthly_backtest/
 results_monthly_backtest*/
-results/
-analysis_results/
+results*/
+analysis_results*/
 swanlog/
 vis_conditional_adapts/
 
