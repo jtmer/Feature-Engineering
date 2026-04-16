@@ -34,13 +34,13 @@ MAX_CONCURRENT_JOBS = 8
 # 基础命令参数
 BASE_ARGS = {
     "--data_path": "/data/Xiexin/EPF/shanxi_spot_trading_data-predValue.csv",
-    "--out_root": "./results3/results_monthly_backtest",
+    "--out_root": "./results4test/results_monthly_backtest",
     # "--out_root": "/share/workspace/mahaoke/results/results_monthly_backtest",
     "--time_col": "time",
     "--target_col": "day_ahead_clearing_price",
     "--drop_cols": "time,realtime_clearing_price",
-    "--start_ym": "2024-08",
-    "--end_ym": "2025-07",
+    "--start_ym": "2025-01",
+    "--end_ym": "2025-02",
     "--train_years": 2,
     "--val_months": 1,
     "--target_hour": 0,
@@ -117,14 +117,33 @@ BASE_ARGS = {
 #     "--decoder_lr": [1e-4, 5e-5, 1e-5],
 #     "--block_future_pred_to_decoder": [0, 1]
 # }
+# SEARCH_SPACE = {
+#     "--lambda_latent_scale": [1e-4],
+#     "--latent_rms_target": [12.0],
+#     "--train_lr": [1e-4],
+#     "--lambda_past_recon": [1.0, 2.0],
+#     "--lambda_future_pred": [1.0, 2.0, 4.0],
+#     "--lambda_stats_pred": [0.0],
+#     "--lambda_y_patch_std": [1.0, 0.5, 0.2, 0.05],
+#     "--lambda_proxy_floor": [2.0],
+#     "--proxy_sens_floor": [0.40],
+#     "--lambda_ratio_floor": [1.0],
+#     "--proxy_cov_ratio_floor": [0.40],
+#     "--lambda_monitor": [1.0],
+#     "--latent_std_floor": [0.3],
+#     "--lambda_latent_std_floor": [0.0],
+#     "--decoder_lr": [1e-5, 3e-5],
+#     "--block_future_pred_to_decoder": [0],
+#     # "--covariate_residual_scale": [0.3, 0.5, 0.8]
+# }
 SEARCH_SPACE = {
-    "--lambda_latent_scale": [3e-4],
+    "--lambda_latent_scale": [1e-4],
     "--latent_rms_target": [12.0],
     "--train_lr": [1e-4],
-    "--lambda_past_recon": [1.0],
+    "--lambda_past_recon": [2.0, 3.0, 4.0, 5.0, 6.0],
     "--lambda_future_pred": [2.0],
     "--lambda_stats_pred": [0.0],
-    "--lambda_y_patch_std": [1.0],
+    "--lambda_y_patch_std": [0.5],
     "--lambda_proxy_floor": [2.0],
     "--proxy_sens_floor": [0.40],
     "--lambda_ratio_floor": [1.0],
@@ -132,8 +151,8 @@ SEARCH_SPACE = {
     "--lambda_monitor": [1.0],
     "--latent_std_floor": [0.3],
     "--lambda_latent_std_floor": [0.0],
-    "--decoder_lr": [1e-5, 3e-5],
-    "--block_future_pred_to_decoder": [0, 1],
+    "--decoder_lr": [5e-5],
+    "--block_future_pred_to_decoder": [0],
     # "--covariate_residual_scale": [0.3, 0.5, 0.8]
 }
 
@@ -186,7 +205,7 @@ def generate_jobs() -> List[Dict[str, Any]]:
 
 def is_job_completed(job_cfg: Dict[str, Any]) -> bool:
     exp_suffix = job_cfg["--exp_suffix"]
-    out_dir = Path(job_cfg["--out_root"] + "_" + exp_suffix)
+    out_dir = Path(job_cfg["--out_root"] + "__" + exp_suffix)
 
     # 你也可以换成别的更严格标记
     done_file = out_dir / "results_summary.csv"

@@ -8,6 +8,8 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
@@ -387,6 +389,18 @@ def imape_ad(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-6) -> float
     # adjusted (sMAPE-style)
     denom = (np.abs(y_true) + np.abs(y_pred) + eps)
     return float(np.mean(2.0 * np.abs(y_true - y_pred) / denom) * 100.0)
+
+
+def irmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def iwape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-6) -> float:
+    return float(np.sum(np.abs(y_true - y_pred)) / (np.sum(np.abs(y_true)) + eps) * 100.0)
+
+
+def ibias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(y_pred - y_true))
 
 '''
 def _imse_imae_workday(
@@ -923,8 +937,8 @@ def predict_and_metrics_one_month(
     B = y_p_te.shape[0]
     if B == 0:
         return dict(
-            iMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan,
-            coverage=np.nan, n_windows=0, n_days_used=0
+            iMSE=np.nan, iRMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan,
+            iWAPE=np.nan, iBias=np.nan, coverage=np.nan, n_windows=0, n_days_used=0
         )
 
     pack = model.predict(
@@ -963,13 +977,19 @@ def predict_and_metrics_one_month(
     if np.any(used_mask):
         true_used = true_y_inv[used_mask]
         pred_used = mean_y_inv[used_mask]
+        iRMSE = irmse(true_used, pred_used)
         iMAPE = imape(true_used, pred_used)
         iMAPE_ad = imape_ad(true_used, pred_used)
+        iWAPE = iwape(true_used, pred_used)
+        iBias = ibias(true_used, pred_used)
         covered = (true_y_inv[used_mask] >= lb_y_inv[used_mask]) & (true_y_inv[used_mask] <= ub_y_inv[used_mask])
         coverage = float(covered.mean())
     else:
+        iRMSE = float("nan")
         iMAPE = float("nan")
         iMAPE_ad = float("nan")
+        iWAPE = float("nan")
+        iBias = float("nan")
         coverage = float("nan")
 
     # ---- per-window errors for plots (only used days) ----
@@ -989,6 +1009,7 @@ def predict_and_metrics_one_month(
 
     iMSEs = np.mean((true_plot - mean_plot) ** 2, axis=1)  # (B_used,)
     iMAEs = np.mean(np.abs(true_plot - mean_plot), axis=1)  # (B_used,)
+    iRMSEs = np.sqrt(np.mean((true_plot - mean_plot) ** 2, axis=1))
     iMAPEs = np.mean(np.abs(true_plot - mean_plot) / (np.abs(true_plot) + eps), axis=1) * 100.0
     iMAPE_ads = np.mean(
         2.0 * np.abs(true_plot - mean_plot) / (np.abs(true_plot) + np.abs(mean_plot) + eps),
@@ -1023,6 +1044,7 @@ def predict_and_metrics_one_month(
     # error plots
     plt.figure(figsize=(12, 3))
     plt.plot(iMSEs, label="iMSE per window")
+    plt.plot(iRMSEs, label="iRMSE per window")
     plt.plot(iMAEs, label="iMAE per window")
     plt.plot(iMAPEs, label="iMAPE per window (%)")
     plt.plot(iMAPE_ads, label="iMAPE-ad per window (%)")
@@ -1048,6 +1070,7 @@ def predict_and_metrics_one_month(
 
     fig, ax = plt.subplots(figsize=(12, 3))
     safe_hist(ax, iMSEs, bins=20, label="iMSE")
+    safe_hist(ax, iRMSEs, bins=20, label="iRMSE")
     safe_hist(ax, iMAEs, bins=20, label="iMAE")
     safe_hist(ax, iMAPEs, bins=20, label="iMAPE (%)")
     safe_hist(ax, iMAPE_ads, bins=20, label="iMAPE-ad (%)")
@@ -1073,9 +1096,12 @@ def predict_and_metrics_one_month(
 
     return dict(
         iMSE=iMSE_wd,
+        iRMSE=iRMSE,
         iMAE=iMAE_wd,
         iMAPE=iMAPE,
         iMAPE_ad=iMAPE_ad,
+        iWAPE=iWAPE,
+        iBias=iBias,
         coverage=coverage,
         n_windows=int(B),
         n_days_used=int(wd_cnt.get("used", 0)),
@@ -1111,7 +1137,7 @@ def build_parser():
     # model / pipeline
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--model_name", type=str, default="/data/mahaoke/Feature-Engineering/AdaPTS_plus/sundial")
-    p.add_argument("--z_dim", type=int, default=1)
+    p.add_argument("--z_dim", type=int, default=8)
     p.add_argument("--patch_size", type=int, default=16)
 
     p.add_argument("--encoder_type", type=str, default="neural", choices=["none", "neural"])
@@ -1144,7 +1170,7 @@ def build_parser():
     p.add_argument("--lambda_latent_std_floor", type=float, default=0.0)
 
     p.add_argument("--train_epochs", type=int, default=60)
-    p.add_argument("--train_bs", type=int, default=32)
+    p.add_argument("--train_bs", type=int, default=16)
     p.add_argument("--train_lr", type=float, default=1e-4)
     p.add_argument("--train_wd", type=float, default=1e-4)
     p.add_argument("--lambda_past_recon", type=float, default=1)
@@ -1418,12 +1444,12 @@ def main():
 
         if y_p_tr.shape[0] == 0:
             logger.info(f"[skip] Train windows empty in month {month_tag}")
-            results.append(dict(month=month_tag, iMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan, coverage=np.nan, n_windows=0, n_days_used=0))
+            results.append(dict(month=month_tag, iMSE=np.nan, iRMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan, iWAPE=np.nan, iBias=np.nan, coverage=np.nan, n_windows=0, n_days_used=0))
             continue
 
         if y_p_te.shape[0] == 0:
             logger.info(f"[skip] Test daily windows empty in month {month_tag}")
-            results.append(dict(month=month_tag, iMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan, coverage=np.nan, n_windows=0, n_days_used=0))
+            results.append(dict(month=month_tag, iMSE=np.nan, iRMSE=np.nan, iMAE=np.nan, iMAPE=np.nan, iMAPE_ad=np.nan, iWAPE=np.nan, iBias=np.nan, coverage=np.nan, n_windows=0, n_days_used=0))
             continue
 
         # ---- build model for this month ----
@@ -1709,7 +1735,7 @@ def main():
 
         logger.info(
             f"[Test {month_tag}] iMSE={metrics['iMSE']:.4f}  iMAE={metrics['iMAE']:.4f} "
-            f"iMAPE={metrics['iMAPE']:.2f}% iMAPE-adj={metrics['iMAPE_ad']:.2f}% "
+            f"iRMSE={metrics['iRMSE']:.4f} iMAPE={metrics['iMAPE']:.2f}% iMAPE-adj={metrics['iMAPE_ad']:.2f}% iWAPE={metrics['iWAPE']:.2f}% iBias={metrics['iBias']:.4f} "
             f"coverage={metrics['coverage']:.3f}  n_windows={metrics['n_windows']}  "
             f"n_days_used={metrics.get('n_days_used', 0)}"
         )
@@ -1725,7 +1751,7 @@ def main():
     logger.info(f"[Saved] {res_path}")
 
     if len(res_df) > 0:
-        cols = ["iMSE", "iMAE", "iMAPE", "iMAPE_ad", "coverage"]
+        cols = ["iMSE", "iRMSE", "iMAE", "iMAPE", "iMAPE_ad", "iWAPE", "iBias", "coverage"]
         overall = {c: float(np.nanmean(res_df[c].to_numpy(dtype=np.float64))) for c in cols if c in res_df.columns}
         logger.info("\n==================== SUMMARY (nan-mean over months) ====================")
         logger.info(overall)

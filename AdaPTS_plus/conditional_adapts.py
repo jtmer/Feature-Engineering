@@ -443,33 +443,22 @@ class ConditionalAdaPTS:
     #     return mean, std
 
     def _latent_stats_loss(self, past_latents: torch.Tensor, future_latents: torch.Tensor) -> torch.Tensor:
-        eps = 1e-4
-        clip_val = 5.0
-
-        # 只在时间维上统计
         past_mu = past_latents.mean(dim=-1)
         future_mu = future_latents.mean(dim=-1)
-
-        past_std = past_latents.std(dim=-1).clamp_min(eps)
-        future_std = future_latents.std(dim=-1).clamp_min(eps)
-
-        # ---- mean loss: 先按 past 的尺度归一化，再做裁剪，避免绝对幅值滚雪球 ----
-        mean_scale = past_std.detach() + eps
-        mean_diff = (future_mu - past_mu.detach()) / mean_scale
-        mean_diff = torch.clamp(mean_diff, -clip_val, clip_val)
-        loss_mu = F.smooth_l1_loss(mean_diff, torch.zeros_like(mean_diff))
-
-        # ---- std loss: 在 log-std 空间对齐，更稳定 ----
-        log_past_std = torch.log(past_std.detach())
-        log_future_std = torch.log(future_std)
-        log_std_diff = torch.clamp(log_future_std - log_past_std, -clip_val, clip_val)
-        loss_std = F.smooth_l1_loss(log_std_diff, torch.zeros_like(log_std_diff))
-
-        return loss_mu + loss_std
+        past_std = past_latents.std(dim=-1)
+        future_std = future_latents.std(dim=-1)
+        return F.mse_loss(past_mu, future_mu) + F.mse_loss(past_std, future_std)
 
     def _compute_alpha_stats(self, epoch: int, n_epochs: int) -> float:
         progress = epoch / max(1, n_epochs - 1)
         return float(np.clip((progress - 0.1) / 0.4, 0.0, 1.0))
+
+    def _decode_parts(self, latents: torch.Tensor, covariates: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if hasattr(self.adapter, "decode_parts"):
+            parts = self.adapter.decode_parts(latents, covariates)
+            return {"y_hat": parts.y_hat, "y_self": parts.y_self, "y_cov": parts.y_cov}
+        y_hat = self.adapter.decode(latents, covariates)
+        return {"y_hat": y_hat, "y_self": y_hat, "y_cov": torch.zeros_like(y_hat)}
 
     # def _norm_past(self, y_past: torch.Tensor, patch_size: int, use_patch_revin: bool):
     #     if use_patch_revin:
@@ -597,18 +586,17 @@ class ConditionalAdaPTS:
 
         # -------- encode / decode --------
         past_latents = self.adapter.encode(y_past_norm, x_past)
-        if past_latents.size(1) != 1:
-            raise ValueError(f"[{mode}] latent_dim must be 1 for proxy/residual setting, got {past_latents.size(1)}")
 
         y_future_norm_true = self.adapter.normalizer.norm_future_with_true_stats(
             y_future, mu_t_true=future_mu_t_true, std_t_true=future_std_t_true
         )
         future_latents_true = self.adapter.encode(y_future_norm_true, x_future)
-        if future_latents_true.size(1) != 1:
-            raise ValueError(f"[{mode}] latent_dim must be 1, got {future_latents_true.size(1)}")
 
         #* past recon loss
-        past_target_recon_norm = self.adapter.decode(past_latents, x_past)
+        past_parts = self._decode_parts(past_latents, x_past)
+        past_target_recon_norm = past_parts["y_hat"]
+        past_target_self_norm = past_parts["y_self"]
+        past_target_cov_norm = past_parts["y_cov"]
         loss_past_recon = F.mse_loss(past_target_recon_norm, y_past_norm)
         # if use_patch_revin:
         #     past_target_recon = revin_patch_denorm_target(past_target_recon_norm, past_mu_t, past_std_t)
@@ -624,7 +612,10 @@ class ConditionalAdaPTS:
             ltm_batch_size=ltm_batch_size,
         )
         
-        future_target_pred_norm = self.adapter.decode(future_latents_pred, x_future)
+        future_parts = self._decode_parts(future_latents_pred, x_future)
+        future_target_pred_norm = future_parts["y_hat"]
+        future_target_self_norm = future_parts["y_self"]
+        future_target_cov_norm = future_parts["y_cov"]
 
         future_target_pred = self.adapter.normalizer.denorm_future_pred(
             y_future_pred_norm=future_target_pred_norm,
@@ -673,18 +664,17 @@ class ConditionalAdaPTS:
         #* y patch moment loss
         loss_y_patch_moment = torch.tensor(0.0, device=self.device)
         if loss_weights.get("y_patch_moment", 0.0) > 0.0:
-            P = P_fut
-            B, _, H = future_target_pred_norm.shape
-            assert H % P == 0
-            Np = H // P
-            pred4_norm = future_target_pred_norm.view(B, 1, Np, P)
-            true4_norm = target_norm_ref.view(B, 1, Np, P)
-            m_pred = pred4_norm.mean(dim=-1)
-            m_true = true4_norm.mean(dim=-1)
-            ms_pred = (pred4_norm ** 2).mean(dim=-1)
-            ms_true = (true4_norm ** 2).mean(dim=-1)
-            loss_y_patch_moment = F.mse_loss(ms_pred, ms_true) + 0.5 * F.mse_loss(m_pred, m_true)
-
+            B, _, H = future_target_pred.shape
+            if H % P_fut != 0:
+                raise ValueError(f"future horizon H={H} must be divisible by patch size P_fut={P_fut}")
+            Np = H // P_fut
+            pred4_raw = future_target_pred.view(B, 1, Np, P_fut)
+            true4_raw = y_future.view(B, 1, Np, P_fut)
+            m_pred = pred4_raw.mean(dim=-1)
+            m_true = true4_raw.mean(dim=-1)
+            s_pred = pred4_raw.std(dim=-1)
+            s_true = true4_raw.std(dim=-1)
+            loss_y_patch_moment = F.mse_loss(s_pred, s_true) + 0.5 * F.mse_loss(m_pred, m_true)
 
         total_loss = (
             loss_weights.get("past_recon", 1.0) * loss_past_recon
@@ -717,7 +707,11 @@ class ConditionalAdaPTS:
                 "adapter_decode": self.adapter.decode,
                 "past_target_norm": y_past_norm.detach(),
                 "past_target_recon_norm": past_target_recon_norm.detach(),
+                "past_target_self_norm": past_target_self_norm.detach(),
+                "past_target_cov_norm": past_target_cov_norm.detach(),
                 "future_target_pred_norm": future_target_pred_norm.detach(),
+                "future_target_self_norm": future_target_self_norm.detach(),
+                "future_target_cov_norm": future_target_cov_norm.detach(),
                 "target_norm_ref": target_norm_ref.detach(),
                 "future_target_pred": future_target_pred.detach(),
                 "future_target_true": y_future.detach(),
@@ -1847,7 +1841,7 @@ class ConditionalAdaPTS:
                     **ltm_kwargs,
                 )
 
-                future_target_pred_norm = self.adapter.decode(future_latents_pred, future_covariates_tensor)
+                future_target_pred_norm = self._decode_parts(future_latents_pred, future_covariates_tensor)["y_hat"]
 
                 mu_t_hat, std_t_hat, _, _, _ = self.adapter.predict_future_stats(future_covariates_tensor)
                 # IdentityNormalizer will ignore these effectively

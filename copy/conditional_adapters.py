@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

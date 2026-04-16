@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -569,7 +571,7 @@ class NeuralTargetDecoder(nn.Module):
         self.covariates_residual = nn.Conv1d(hidden_dim, 1, kernel_size=1)
         self.covariates_gate = nn.Sequential(
             nn.Conv1d(hidden_dim, 1, kernel_size=1),
-            nn.Sigmoid(),
+            nn.Sigmoid(), 
         )
 
         # self.normalize_latents = normalize_latents
@@ -590,10 +592,10 @@ class NeuralTargetDecoder(nn.Module):
         covariates_series = covariates_series.to(device)
         latent_series = self.latent_normalizer(latent_series)
 
-        target_base = self.latent_decoder(latent_series)                        # (B,1,L)
-        covariates_hidden = self.covariates_proj(covariates_series)             # (B,H,L)
-        target_residual = self.covariates_residual(covariates_hidden)           # (B,1,L)
-        target_gate = self.covariates_gate(covariates_hidden)                   # (B,1,L)
+        target_base = self.latent_decoder(latent_series)                        
+        covariates_hidden = self.covariates_proj(covariates_series)             
+        target_residual = self.covariates_residual(covariates_hidden)         
+        target_gate = self.covariates_gate(covariates_hidden)                   
         target_hat = target_base + self.covariate_residual_scale * target_gate * target_residual
         return target_hat
         # out = self.target_decoder(decoder_inputs)   # (B,2,T)
@@ -716,7 +718,7 @@ def build_pipeline_adapter(
             revin_patch_size_past=patch_size,
             hidden_dim=256,
             encoder_layers=2,
-            dropout=0.0,
+            dropout=0.1,
             normalize_latents=False,
         )
 
@@ -727,7 +729,7 @@ def build_pipeline_adapter(
             revin_patch_size_future=patch_size,
             hidden_dim=256,
             decoder_layers=2,
-            dropout=0.0,
+            dropout=0.1,
             normalize_latents=False,
         )
 
